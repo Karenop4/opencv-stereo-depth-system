@@ -1,0 +1,6 @@
+path: /home/user/Documentos/7mo ciclo/Vision_Computador/Proyecto/progC/yolov26/datasets/human-faces
+train: images/train
+val: images/val
+
+names:
+  0: face

@@ -1,0 +1,42 @@
+# Build artifacts
+main_stereo
+*.o
+*.out
+*.a
+*.so
+*.so.*
+
+# Generated captures and recordings
+salida_stereo.avi
+frame_*_vision.png
+frame_*_depth.png
+*.avi
+*.mp4
+
+# Local calibration/runtime tweaks that may change during demos
+scale.yml
+
+# Large local model/runtime assets
+shape_predictor_68_face_landmarks.dat
+onnxruntime-linux-x64-*/
+
+# YOLO training outputs and datasets
+yolov26/Human Faces Dataset/
+yolov26/datasets/
+yolov26/runs/
+yolov26/**/*.pt
+
+# Python caches
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Editor and OS noise
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+.venv/
