@@ -159,7 +159,7 @@ void StereoProcessor::computeDisparity(const cv::Mat& rectL, const cv::Mat& rect
     cv::cuda::cvtColor(d_rectR, d_gR, cv::COLOR_BGR2GRAY);
 
     if (claheTrack == 1) {
-        auto d_clahe = cv::cuda::createCLAHE(2.0, cv::Size(8, 8));
+        auto d_clahe = cv::cuda::createCLAHE(1.0, cv::Size(16, 16));
         d_clahe->apply(d_gL, d_gL);
         d_clahe->apply(d_gR, d_gR);
     }

@@ -427,50 +427,6 @@ static bool detectarObjetoPorProfundidad(
     return true;
 }
 
-/**
- * @brief Dibuja una capa AR que cambia con la distancia estimada.
- * @param canvas Imagen BGR donde se compone el overlay.
- * @param box Caja del objeto medido.
- * @param distanciaCm Distancia filtrada y calibrada en centímetros.
- * @return No devuelve valor.
- * @note Justificación: cumple el criterio de AR dinámico, porque escala,
- * color y posición del retículo dependen de la profundidad medida en tiempo real.
- */
-static void dibujarEfectoARDistancia(cv::Mat& canvas, const cv::Rect& box, double distanciaCm) {
-    if (canvas.empty() || box.empty() || distanciaCm <= 0.0) return;
-
-    const cv::Rect safe = box & cv::Rect(0, 0, canvas.cols, canvas.rows);
-    if (safe.empty()) return;
-
-    const double nearFactor = 1.0 - std::clamp((distanciaCm - 20.0) / 180.0, 0.0, 1.0);
-    const int pulse = static_cast<int>(8.0 + nearFactor * 28.0);
-    const int thickness = 2 + static_cast<int>(nearFactor * 4.0);
-    const cv::Scalar color(
-        30.0,
-        80.0 + nearFactor * 175.0,
-        255.0 - nearFactor * 190.0);
-
-    cv::Mat overlay = canvas.clone();
-    cv::Point center(safe.x + safe.width / 2, safe.y + safe.height / 2);
-    cv::Size haloSize(
-        std::max(12, safe.width / 2 + pulse),
-        std::max(12, safe.height / 2 + pulse));
-
-    cv::ellipse(overlay, center, haloSize, 0.0, 0.0, 360.0, color, thickness, cv::LINE_AA);
-    cv::line(overlay, {center.x - pulse, center.y}, {center.x + pulse, center.y}, color, 2, cv::LINE_AA);
-    cv::line(overlay, {center.x, center.y - pulse}, {center.x, center.y + pulse}, color, 2, cv::LINE_AA);
-
-    const int barHeight = std::clamp(static_cast<int>(nearFactor * safe.height), 6, std::max(6, safe.height));
-    cv::Rect depthBar(
-        std::clamp(safe.x + safe.width + 8, 0, std::max(0, canvas.cols - 10)),
-        std::clamp(safe.y + safe.height - barHeight, 0, std::max(0, canvas.rows - barHeight)),
-        8,
-        barHeight);
-    cv::rectangle(overlay, depthBar, color, -1, cv::LINE_AA);
-
-    cv::addWeighted(overlay, 0.38, canvas, 0.62, 0.0, canvas);
-}
-
 } // namespace
 
 /**
@@ -484,8 +440,8 @@ int main() {
     YOLODetector faceDetector("yolov26/runs/detect/yolov26_faces/weights/best.onnx");
     FaceSwapper faceSwapper("shape_predictor_68_face_landmarks.dat");
 
-    const std::string leftUrl  = "http://192.168.3.45:81/stream";
-    const std::string rightUrl = "http://192.168.3.44:81/stream";
+    const std::string leftUrl  = "http://10.42.0.206:81/stream";
+    const std::string rightUrl = "http://10.42.0.134:81/stream";
     configure_esp32_cam(leftUrl, ESP32_CONTROLES);
     configure_esp32_cam(rightUrl, ESP32_CONTROLES);
 
@@ -599,7 +555,6 @@ int main() {
 
         cv::Rect objetoCentral;
         double distanciaCentralRawCm = -1.0;
-        double distanciaDisplayCm = -1.0;
 
         if (!objetoVisual.empty() && !points3D.empty()) {
             objetoCentral = objetoVisual;
@@ -673,7 +628,6 @@ int main() {
                 double zSuavizadoRawCm = suavCentral.agregar(distanciaCentralRawCm);
                 double zKalmanRawCm = kalmanCentral.actualizar(zSuavizadoRawCm);
                 double zDisplayCm = zKalmanRawCm * stereoProc.scaleFactor;
-                distanciaDisplayCm = zDisplayCm;
                 snprintf(distBuf, sizeof(distBuf), "Distancia: %.1f cm", zDisplayCm);
             } else {
                 snprintf(distBuf, sizeof(distBuf), "Distancia: -- cm");
@@ -688,7 +642,6 @@ int main() {
                 {tx + ts.width + 5, ty + base + 4},
                 cv::Scalar(0, 0, 0), -1);
             cv::putText(canvas, distBuf, {tx, ty}, cv::FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv::LINE_AA);
-            dibujarEfectoARDistancia(canvas, box, distanciaDisplayCm);
         }
 
         cv::Mat dispVis, dispNorm;
@@ -707,7 +660,7 @@ int main() {
         cv::Mat kernelClose = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 5));
         cv::morphologyEx(dispNorm, dispNorm, cv::MORPH_CLOSE, kernelClose);
         cv::morphologyEx(dispVisMask, dispVisMask, cv::MORPH_CLOSE, kernelClose);
-        auto claheDisp = cv::createCLAHE(2.0, cv::Size(8, 8));
+        auto claheDisp = cv::createCLAHE(1.0, cv::Size(16, 16));
         claheDisp->apply(dispNorm, dispNorm);
         cv::cvtColor(dispNorm, dispVis, cv::COLOR_GRAY2BGR);
         dispVis.setTo(cv::Scalar(0,0,0), ~dispVisMask);

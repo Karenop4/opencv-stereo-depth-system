@@ -17,7 +17,7 @@ SRCS = main_stereo.cpp CameraStream.cpp StereoProcessor.cpp FaceSwapper.cpp YOLO
 | Arquitectura de captura y hardware | Cumplido | `CameraStream` usa hilos para capturar ambas ESP32-CAM; `configure_esp32_cam()` ajusta AEC, AGC, brillo, contraste y XCLK. |
 | Calidad del mapa de disparidad | Cumplido | `StereoProcessor::computeDisparity()` usa CLAHE opcional, CUDA StereoSGM, filtro WLS, mediana y visualizacion con percentiles. |
 | Precision y estabilidad de distancia | Cumplido | `cv::reprojectImageTo3D()` usa `qMatrix`; tambien se valida con formula `Z = f * B / d`; la lectura pasa por media movil y Kalman 1D. |
-| Efecto AR | Cumplido | `FaceSwapper` realiza intercambio facial; `dibujarEfectoARDistancia()` cambia escala, color y comportamiento segun la distancia medida. |
+| Efecto AR | Cumplido | `FaceSwapper` realiza intercambio facial sobre la transmision a color. |
 | Defensa individual | Preparado | Este README resume que responder sobre Q, threads, locks, SGM, WLS, Kalman y calibracion. |
 
 ## Flujo General del Sistema
@@ -192,7 +192,6 @@ El AR tiene dos componentes:
 
 1. Deteccion facial con YOLO ONNX.
 2. Intercambio facial con dlib landmarks.
-3. Overlay dinamico de distancia sobre el objeto detectado.
 
 `YOLODetector` carga `best.onnx` y devuelve cajas faciales. Si hay dos rostros, `FaceSwapper::swapFaces()`:
 
@@ -204,16 +203,9 @@ El AR tiene dos componentes:
 - Suaviza bordes con erosion y blur.
 - Compone el resultado sobre el frame.
 
-El efecto que reacciona a distancia esta en `dibujarEfectoARDistancia()`:
-
-- Si el objeto esta cerca, aumenta el halo.
-- Cambia color segun profundidad.
-- Cambia la barra de proximidad.
-- Se dibuja sobre la transmision a color.
-
 Respuesta oral sugerida:
 
-> El FaceSwap es el efecto visual original. Para cumplir la condicion dinamica de la rubrica, tambien dibujo un reticulo AR cuyo tamano, color y barra de proximidad dependen de la distancia filtrada. Asi el AR no es estatico: responde directamente a la profundidad medida.
+> El FaceSwap es el efecto visual original del proyecto. Detectamos rostros con YOLO, obtenemos landmarks con dlib y hacemos una transformacion afin para intercambiar las caras en tiempo real sobre la transmision a color.
 
 ## 5. Matriz Q: Explicacion para Defensa
 
@@ -334,5 +326,4 @@ Controles:
 
 ## 9. Guion Corto para Presentacion
 
-> Nuestro sistema usa dos ESP32-CAM configuradas desde C++ para estabilizar exposicion, ganancia y reloj. Cada camara se lee en un hilo independiente, y el hilo principal procesa el ultimo frame sincronizado. Despues rectificamos con la calibracion estereo, calculamos disparidad con StereoSGM en CUDA, aplicamos CLAHE y WLS para mejorar densidad y reducir ruido, y reproyectamos a 3D con la matriz Q. La distancia se obtiene de Z y se valida tambien con la formula f por baseline dividido para disparidad. Para estabilizar la lectura usamos media movil y Kalman 1D. Finalmente, integramos un efecto AR original: intercambio facial y un reticulo dinamico que cambia con la distancia medida.
-
+> Nuestro sistema usa dos ESP32-CAM configuradas desde C++ para estabilizar exposicion, ganancia y reloj. Cada camara se lee en un hilo independiente, y el hilo principal procesa el ultimo frame sincronizado. Despues rectificamos con la calibracion estereo, calculamos disparidad con StereoSGM en CUDA, aplicamos CLAHE y WLS para mejorar densidad y reducir ruido, y reproyectamos a 3D con la matriz Q. La distancia se obtiene de Z y se valida tambien con la formula f por baseline dividido para disparidad. Para estabilizar la lectura usamos media movil y Kalman 1D. Finalmente, integramos un efecto AR original: intercambio facial en tiempo real.
