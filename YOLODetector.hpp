@@ -47,7 +47,7 @@ public:
      * @note Es necesaria para localizar caras de forma estable antes de aplicar
      * el efecto AR y no confundir la estimación de profundidad.
      */
-    std::vector<Detection> detect(const cv::Mat& image, float confThreshold = 0.5f);
+    std::vector<Detection> detect(const cv::Mat& image, float confThreshold = 0.5f, float nmsThreshold = 0.45f);
 
 private:
     Ort::Env env{ORT_LOGGING_LEVEL_WARNING, "YOLODetector"};

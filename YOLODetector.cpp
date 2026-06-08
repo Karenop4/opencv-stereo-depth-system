@@ -1,5 +1,29 @@
 #include "YOLODetector.hpp"
+#include <algorithm>
+#include <cmath>
 #include <iostream>
+
+namespace {
+
+static cv::Rect clampBox(const cv::Rect& box, const cv::Size& bounds) {
+    return box & cv::Rect(0, 0, bounds.width, bounds.height);
+}
+
+static Detection makeDetection(float x1, float y1, float x2, float y2, float conf, int classId,
+                               float xScale, float yScale, const cv::Size& imageSize) {
+    int left = static_cast<int>(std::round(x1 * xScale));
+    int top = static_cast<int>(std::round(y1 * yScale));
+    int right = static_cast<int>(std::round(x2 * xScale));
+    int bottom = static_cast<int>(std::round(y2 * yScale));
+
+    Detection det;
+    det.box = clampBox(cv::Rect(left, top, right - left, bottom - top), imageSize);
+    det.conf = conf;
+    det.classId = classId;
+    return det;
+}
+
+} // namespace
 
 /**
  * @brief Inicializa ONNX Runtime y carga el modelo de detección facial.
@@ -41,7 +65,9 @@ YOLODetector::YOLODetector(const std::string& modelPath, const cv::Size& inputSi
  * @note Justificación: entrega ROIs robustas para el efecto AR y permite
  * excluir rostros de la búsqueda de objetos oscuros/profundidad.
  */
-std::vector<Detection> YOLODetector::detect(const cv::Mat& image, float confThreshold) {
+std::vector<Detection> YOLODetector::detect(const cv::Mat& image, float confThreshold, float nmsThreshold) {
+    if (image.empty()) return {};
+
     cv::Mat blob;
     cv::dnn::blobFromImage(image, blob, 1.0 / 255.0, inputSize, cv::Scalar(), true, false);
 
@@ -59,32 +85,88 @@ std::vector<Detection> YOLODetector::detect(const cv::Mat& image, float confThre
     auto type_info = outputTensors.front().GetTensorTypeAndShapeInfo();
     auto shape = type_info.GetShape();
 
-    float x_scale = static_cast<float>(image.cols) / inputSize.width;
-    float y_scale = static_cast<float>(image.rows) / inputSize.height;
+    const float xScale = static_cast<float>(image.cols) / inputSize.width;
+    const float yScale = static_cast<float>(image.rows) / inputSize.height;
 
-    if (shape.size() == 3 && shape[2] == 6) {
-        int num_boxes = shape[1];
-        for (int i = 0; i < num_boxes; i++) {
-            float x1 = data[i * 6 + 0];
-            float y1 = data[i * 6 + 1];
-            float x2 = data[i * 6 + 2];
-            float y2 = data[i * 6 + 3];
-            float conf = data[i * 6 + 4];
-            int classId = static_cast<int>(data[i * 6 + 5]);
+    std::vector<cv::Rect> boxes;
+    std::vector<float> scores;
+    std::vector<int> classIds;
 
-            if (conf >= confThreshold) {
-                int left = static_cast<int>(x1 * x_scale);
-                int top = static_cast<int>(y1 * y_scale);
-                int right = static_cast<int>(x2 * x_scale);
-                int bottom = static_cast<int>(y2 * y_scale);
+    auto pushCandidate = [&](float cx, float cy, float w, float h, float conf, int classId) {
+        if (conf < confThreshold || w <= 2.0f || h <= 2.0f) return;
+        Detection det = makeDetection(cx - w * 0.5f, cy - h * 0.5f, cx + w * 0.5f, cy + h * 0.5f,
+                                      conf, classId, xScale, yScale, image.size());
+        if (det.box.area() <= 0) return;
+        boxes.push_back(det.box);
+        scores.push_back(det.conf);
+        classIds.push_back(det.classId);
+    };
 
-                Detection det;
-                det.box = cv::Rect(left, top, right - left, bottom - top);
-                det.conf = conf;
-                det.classId = classId;
-                detections.push_back(det);
+    auto pushCandidateXYXY = [&](float x1, float y1, float x2, float y2, float conf, int classId) {
+        if (conf < confThreshold) return;
+        Detection det = makeDetection(x1, y1, x2, y2, conf, classId, xScale, yScale, image.size());
+        if (det.box.area() <= 0) return;
+        boxes.push_back(det.box);
+        scores.push_back(det.conf);
+        classIds.push_back(det.classId);
+    };
+
+    if (shape.size() == 3) {
+        const int dim1 = static_cast<int>(shape[1]);
+        const int dim2 = static_cast<int>(shape[2]);
+
+        if (dim2 == 6 && dim1 <= 1000) {
+            for (int i = 0; i < dim1; ++i) {
+                const float* row = data + i * dim2;
+                pushCandidateXYXY(row[0], row[1], row[2], row[3], row[4], static_cast<int>(row[5]));
+            }
+        } else if (dim2 >= 5 && dim2 <= 128) {
+            for (int i = 0; i < dim1; ++i) {
+                const float* row = data + i * dim2;
+                float bestScore = row[4];
+                int classId = 0;
+                for (int c = 5; c < dim2; ++c) {
+                    if (row[c] > bestScore) {
+                        bestScore = row[c];
+                        classId = c - 5;
+                    }
+                }
+                pushCandidate(row[0], row[1], row[2], row[3], bestScore, classId);
+            }
+        } else if (dim1 >= 5 && dim1 <= 128) {
+            for (int i = 0; i < dim2; ++i) {
+                float bestScore = data[4 * dim2 + i];
+                int classId = 0;
+                for (int c = 5; c < dim1; ++c) {
+                    const float score = data[c * dim2 + i];
+                    if (score > bestScore) {
+                        bestScore = score;
+                        classId = c - 5;
+                    }
+                }
+                pushCandidate(data[i], data[dim2 + i], data[2 * dim2 + i], data[3 * dim2 + i],
+                              bestScore, classId);
             }
         }
+    } else if (shape.size() == 2 && shape[1] >= 6) {
+        const int rows = static_cast<int>(shape[0]);
+        const int attrs = static_cast<int>(shape[1]);
+        for (int i = 0; i < rows; ++i) {
+            const float* row = data + i * attrs;
+            pushCandidateXYXY(row[0], row[1], row[2], row[3], row[4], static_cast<int>(row[5]));
+        }
     }
+
+    std::vector<int> keep;
+    cv::dnn::NMSBoxes(boxes, scores, confThreshold, nmsThreshold, keep);
+    detections.reserve(keep.size());
+    for (int idx : keep) {
+        detections.push_back({boxes[idx], scores[idx], classIds[idx]});
+    }
+
+    std::sort(detections.begin(), detections.end(), [](const Detection& a, const Detection& b) {
+        return a.conf > b.conf;
+    });
+
     return detections;
 }

@@ -332,6 +332,53 @@ static cv::Rect detectarObjetoOscuroRectangular(const cv::Mat& frame, double are
 }
 
 /**
+ * @brief Filtra y ordena detecciones faciales para el efecto AR.
+ * @param detections Detecciones crudas del YOLO.
+ * @param bounds Tamaño del frame donde se aplicará el FaceSwap.
+ * @return Rostros válidos, recortados al frame y ordenados por confianza.
+ * @note Evita que cajas parcialmente fuera de imagen rompan el predictor de landmarks.
+ */
+static std::vector<Detection> prepararRostrosParaAR(const std::vector<Detection>& detections, const cv::Size& bounds) {
+    std::vector<Detection> faces;
+    const cv::Rect frameBounds(0, 0, bounds.width, bounds.height);
+
+    for (Detection det : detections) {
+        det.box &= frameBounds;
+        if (det.box.width < 24 || det.box.height < 24) continue;
+        if (det.box.area() < 900) continue;
+        faces.push_back(det);
+    }
+
+    std::sort(faces.begin(), faces.end(), [](const Detection& a, const Detection& b) {
+        return a.conf > b.conf;
+    });
+    return faces;
+}
+
+/**
+ * @brief Elige dos rostros estables para intercambiar.
+ * @param faces Detecciones faciales ya filtradas.
+ * @return Par de cajas en orden izquierda-derecha, o vacío si no hay dos rostros.
+ * @note Prioriza rostros grandes entre los más confiables para estabilizar landmarks.
+ */
+static std::vector<cv::Rect> seleccionarRostrosSwap(const std::vector<Detection>& faces) {
+    if (faces.size() < 2) return {};
+
+    std::vector<Detection> candidates = faces;
+    if (candidates.size() > 4) candidates.resize(4);
+
+    std::sort(candidates.begin(), candidates.end(), [](const Detection& a, const Detection& b) {
+        return a.box.area() > b.box.area();
+    });
+
+    std::vector<cv::Rect> boxes = {candidates[0].box, candidates[1].box};
+    std::sort(boxes.begin(), boxes.end(), [](const cv::Rect& a, const cv::Rect& b) {
+        return a.x + a.width * 0.5 < b.x + b.width * 0.5;
+    });
+    return boxes;
+}
+
+/**
  * @brief Detecta el objeto más cercano usando la nube de puntos 3D.
  * @param points3D Nube de puntos en milímetros.
  * @param depthThreshCm Umbral máximo de distancia en centímetros.
@@ -440,8 +487,8 @@ int main() {
     YOLODetector faceDetector("yolov26/runs/detect/yolov26_faces/weights/best.onnx");
     FaceSwapper faceSwapper("shape_predictor_68_face_landmarks.dat");
 
-    const std::string leftUrl  = "http://10.42.0.206:81/stream";
-    const std::string rightUrl = "http://10.42.0.134:81/stream";
+    const std::string leftUrl  = "http://192.168.137.168:81/stream";
+    const std::string rightUrl = "http://192.168.137.46:81/stream";
     configure_esp32_cam(leftUrl, ESP32_CONTROLES);
     configure_esp32_cam(rightUrl, ESP32_CONTROLES);
 
@@ -468,6 +515,7 @@ int main() {
     std::cout << "  Area min x100 -> tamaño minimo de objeto" << std::endl;
     std::cout << "  Num Disp      -> 64 / 128 / 256" << std::endl;
     std::cout << "  Dist max cm   -> umbral de objeto cercano" << std::endl;
+    std::cout << "  FaceSwap      -> automatico con 2 rostros YOLO" << std::endl;
     std::cout << "  [C]           -> calibrar distancia actual" << std::endl;
     std::cout << "  [S]           -> guardar frame" << std::endl;
     std::cout << "  [ESC]         -> salir" << std::endl;
@@ -479,6 +527,7 @@ int main() {
     Kalman1D kalmanCentral(0.05, 4.0);
     int frame_idx = 0;
     double lastRawDistanceCm = -1.0;
+    bool faceSwapWarned = false;
 
     while (true) {
         lastRawDistanceCm = -1.0;
@@ -532,7 +581,7 @@ int main() {
         }
         double areaMin = minAreaTrack * 100.0;
         
-        std::vector<Detection> faces = faceDetector.detect(vistaL, 0.5f);
+        std::vector<Detection> faces = prepararRostrosParaAR(faceDetector.detect(vistaL, 0.35f), vistaL.size());
         cv::Rect objetoVisual = detectarObjetoOscuroRectangular(vistaL, areaMin, faces);
 
         cv::Mat validDispMask = (dispF > 2.0f) & (dispF < 200.0f);
@@ -545,26 +594,52 @@ int main() {
         validDispMask(cv::Rect(0, 0, validDispMask.cols, borderY)).setTo(0);
         validDispMask(cv::Rect(0, validDispMask.rows - borderY, validDispMask.cols, borderY)).setTo(0);
         cv::Mat canvas = vistaL.clone();
-        if (faces.size() == 2) {
-            faceSwapper.swapFaces(canvas, faces[0].box, faces[1].box);
+        std::vector<cv::Rect> rostrosSwap = seleccionarRostrosSwap(faces);
+        bool faceSwapActivo = false;
+        if (rostrosSwap.size() == 2) {
+            try {
+                faceSwapper.swapFaces(canvas, rostrosSwap[0], rostrosSwap[1]);
+                faceSwapActivo = true;
+            } catch (const cv::Exception& e) {
+                if (!faceSwapWarned) {
+                    std::cerr << "[WARN] FaceSwap no pudo aplicarse con las cajas YOLO actuales: "
+                              << e.what() << std::endl;
+                    faceSwapWarned = true;
+                }
+                for (const auto& f : faces) {
+                    cv::rectangle(canvas, f.box, cv::Scalar(0, 255, 0), 2);
+                }
+            }
         } else {
             for (const auto& f : faces) {
                 cv::rectangle(canvas, f.box, cv::Scalar(0, 255, 0), 2);
             }
         }
 
+        const std::string faceStatus = faceSwapActivo
+            ? "FaceSwap YOLO: ON"
+            : "FaceSwap YOLO: " + std::to_string(faces.size()) + "/2 rostros";
+        cv::putText(canvas, faceStatus, {12, 24}, cv::FONT_HERSHEY_SIMPLEX, 0.6,
+                    faceSwapActivo ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 200, 255),
+                    2, cv::LINE_AA);
+
         cv::Rect objetoCentral;
         double distanciaCentralRawCm = -1.0;
 
-        if (!objetoVisual.empty() && !points3D.empty()) {
+        if (!faces.empty()) {
+            objetoCentral = faces[0].box;
+        } else if (!objetoVisual.empty()) {
             objetoCentral = objetoVisual;
+        }
+
+        if (!objetoCentral.empty() && !points3D.empty()) {
             cv::Rect roiInner(
-                objetoVisual.x + objetoVisual.width / 5,
-                objetoVisual.y + objetoVisual.height / 5,
-                std::max(1, objetoVisual.width * 3 / 5),
-                std::max(1, objetoVisual.height * 3 / 5));
+                objetoCentral.x + objetoCentral.width / 5,
+                objetoCentral.y + objetoCentral.height / 5,
+                std::max(1, objetoCentral.width * 3 / 5),
+                std::max(1, objetoCentral.height * 3 / 5));
             float dispMed = medianaDisparidadConMascara(dispF, roiInner, validDispMask);
-            if (dispMed <= 0) dispMed = medianaDisparidadConMascara(dispF, objetoVisual, validDispMask);
+            if (dispMed <= 0) dispMed = medianaDisparidadConMascara(dispF, objetoCentral, validDispMask);
 
             double zFromDispCm = -1.0;
             if (dispMed > 0) {
@@ -572,7 +647,7 @@ int main() {
             }
 
             double zFromPointsCm = medianaZValida(points3D, roiInner);
-            if (zFromPointsCm <= 0) zFromPointsCm = medianaZValida(points3D, objetoVisual);
+            if (zFromPointsCm <= 0) zFromPointsCm = medianaZValida(points3D, objetoCentral);
             if (zFromPointsCm > 0) zFromPointsCm /= 10.0;
 
             if (zFromDispCm > 0 && zFromPointsCm > 0) {

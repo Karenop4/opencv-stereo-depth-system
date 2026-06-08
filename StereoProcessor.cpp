@@ -71,8 +71,8 @@ StereoProcessor::StereoProcessor(const std::string& calibration_file, const std:
 
     int initNumDisp = std::max(1, 6) * 16;
     int blockSz = 7;
-    int p1 = 8 * 1 * blockSz * blockSz;
-    int p2 = 32 * 1 * blockSz * blockSz;
+    int p1 = 24 * 1 * blockSz * blockSz;
+    int p2 = 96 * 1 * blockSz * blockSz;
     d_sgm = cv::cuda::createStereoSGM(0, initNumDisp, p1, p2, 5, cv::cuda::StereoSGM::MODE_HH);
     
     wls = cv::ximgproc::createDisparityWLSFilterGeneric(false);
@@ -104,8 +104,8 @@ void StereoProcessor::setSGBMParameters(int numDispMult, int blockSz) {
     int bs = std::max(3, blockSz%2==0 ? blockSz+1 : blockSz);
     
     if (nd != last_nd || bs != last_bs) {
-        int p1 = 8 * 1 * bs * bs;
-        int p2 = 32 * 1 * bs * bs;
+        int p1 = 24 * 1 * bs * bs;
+        int p2 = 96 * 1 * bs * bs;
         try {
             auto next = cv::cuda::createStereoSGM(0, nd, p1, p2, 5, cv::cuda::StereoSGM::MODE_HH);
             d_sgm = next;
@@ -157,6 +157,14 @@ void StereoProcessor::computeDisparity(const cv::Mat& rectL, const cv::Mat& rect
     
     cv::cuda::cvtColor(d_rectL, d_gL, cv::COLOR_BGR2GRAY);
     cv::cuda::cvtColor(d_rectR, d_gR, cv::COLOR_BGR2GRAY);
+
+    // --- REQUISITO RÚBRICA: PREPROCESADO E HIGIENIZACIÓN DE BORDES ---
+    // 1. Un filtro de nitidez (Laplaciano o Sobel suave) ayuda a que SGBM encuentre contornos definidos
+    cv::cuda::GpuMat d_edgeL, d_edgeR;
+    cv::cuda::bilateralFilter(d_gL, d_edgeL, 9, 75.0, 75.0);
+    cv::cuda::bilateralFilter(d_gR, d_edgeR, 9, 75.0, 75.0);
+    d_gL = d_edgeL;
+    d_gR = d_edgeR;
 
     if (claheTrack == 1) {
         auto d_clahe = cv::cuda::createCLAHE(1.0, cv::Size(16, 16));
