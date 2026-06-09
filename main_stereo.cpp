@@ -260,13 +260,15 @@ static std::vector<cv::Rect> seleccionarRostrosSwap(const std::vector<Detection>
  * @note Orquesta captura concurrente, filtrado estéreo, calibración y el efecto AR.
  */
 int main(int argc, char** argv) {
+    // Carga calibracion estereo, mapas de rectificacion y factor de escala.
     StereoProcessor stereoProc("parametros_stereo.yml", "scale.yml");
-    
+    // Inicializa los dos modulos "pesados" del efecto AR: detector facial y face swap.
     YOLODetector faceDetector("yolov26/runs/detect/yolov26_faces/weights/best.onnx");
     FaceSwapper faceSwapper("shape_predictor_68_face_landmarks.dat");
 
-    std::string leftUrl  = "http://192.168.18.44:81/stream";
-    std::string rightUrl = "http://192.168.18.43:81/stream";
+    // URLs por defecto de ambas ESP32-CAM; se pueden sobreescribir por argumentos.
+    std::string leftUrl  = "http://192.168.3.45:81/stream";
+    std::string rightUrl = "http://192.168.3.44:81/stream";
     if (argc >= 3) {
         leftUrl = argv[1];
         rightUrl = argv[2];
@@ -277,9 +279,11 @@ int main(int argc, char** argv) {
     std::cout << "[INFO] Camara izquierda: " << leftUrl << std::endl;
     std::cout << "[INFO] Camara derecha:   " << rightUrl << std::endl;
 
+    // Aplica controles de firmware para fijar exposicion, ganancia y color antes de medir profundidad.
     configure_esp32_cam(leftUrl, ESP32_CONTROLES);
     configure_esp32_cam(rightUrl, ESP32_CONTROLES);
 
+    // Crea el estado compartido de cada camara y levanta un hilo de captura por stream.
     CameraStream camLeft(leftUrl);
     CameraStream camRight(rightUrl);
     std::thread threadLeft (capture_loop, &camLeft);
@@ -311,9 +315,11 @@ int main(int argc, char** argv) {
     std::cout << "  [S]           -> guardar frame" << std::endl;
     std::cout << "  [ESC]         -> salir" << std::endl;
 
+    // El video grabado junta imagen izquierda procesada + mapa de disparidad mostrado.
     cv::VideoWriter videoOut("salida_stereo.avi", cv::VideoWriter::fourcc('M','J','P','G'), 10.0, cv::Size(stereoProc.imgSize.width * 2, stereoProc.imgSize.height));
 
     cv::Mat imgLeft, imgRight;
+    // Media movil y Kalman estabilizan la Z final para que no fluctue de frame a frame.
     Suavizador suavCentral(24);
     Kalman1D kalmanCentral(0.03, 9.0);
     int frame_idx = 0;
@@ -327,11 +333,13 @@ int main(int argc, char** argv) {
 
     while (true) {
         lastRawDistanceCm = -1.0;
+        // Copia el ultimo frame publicado por cada hilo de captura.
         bool okL = camLeft.connected  && !camLeft.frame.empty();
         bool okR = camRight.connected && !camRight.frame.empty();
         if (okL) { std::lock_guard<std::mutex> l(camLeft.mtx);  camLeft.frame.copyTo(imgLeft);   }
         if (okR) { std::lock_guard<std::mutex> l(camRight.mtx); camRight.frame.copyTo(imgRight); }
 
+        // Si alguna camara aun no entrega imagen, mostramos una pantalla de espera.
         if (!okL || !okR) {
             cv::Mat w = cv::Mat::zeros(130, 560, CV_8UC3);
             cv::putText(w, "Esperando camaras...", {10,45},
@@ -345,6 +353,7 @@ int main(int argc, char** argv) {
             continue;
         }
 
+        // La edad del frame permite descartar pares demasiado viejos o desfasados en el tiempo.
         double ageL = edadFrameMs(camLeft);
         double ageR = edadFrameMs(camRight);
         double syncDelta = std::abs(ageL - ageR);
@@ -355,12 +364,14 @@ int main(int argc, char** argv) {
             continue;
         }
 
+        // Fuerza ambas imagenes al tamano usado en la calibracion estereo.
         asegurarTamanoCalibrado(imgLeft, stereoProc.imgSize);
         asegurarTamanoCalibrado(imgRight, stereoProc.imgSize);
 
         cv::Mat frameLeft = imgLeft;
         cv::Mat frameRight = imgRight;
         cv::Mat wbLeft, wbRight;
+        // El balance de blancos por software compensa el tinte verde al desactivar AWB en firmware.
         if (wbSoftTrack == 1) {
             balanceBlancosGrayWorld(frameLeft, wbLeft);
             balanceBlancosGrayWorld(frameRight, wbRight);
@@ -374,6 +385,7 @@ int main(int argc, char** argv) {
         cv::Mat procL = rectL.clone();
         cv::Mat procR = rectR.clone();
 
+        // Brillo/contraste solo afectan la rama de profundidad; la vista a color se conserva aparte.
         double alphaC = std::max(0.1, contTrack / 10.0);
         double betaB  = brilloTrack - 100.0;
         if (std::abs(alphaC - 1.0) > 0.05 || std::abs(betaB) > 0.1) {
@@ -381,6 +393,7 @@ int main(int argc, char** argv) {
             procR.convertTo(procR, -1, alphaC, betaB);
         }
 
+        // El sistema elige automaticamente el rango de disparidad segun distancia estable o modo cercano.
         double referenciaAutoCm = kalmanCentral.iniciado ? kalmanCentral.x : lastAcceptedDistanceCm;
         numDispAuto = (modoCercaTrack == 1)
             ? 2
@@ -388,8 +401,10 @@ int main(int argc, char** argv) {
         stereoProc.setSGBMParameters(numDispAuto, blockSz);
         
         cv::Mat dispFilt, dispF;
+        // SGBM + WLS producen disparidad filtrada en float, lista para visualizacion y reproyeccion 3D.
         stereoProc.computeDisparity(procL, procR, claheTrack, dispFilt, dispF);
         if (!dispF.empty()) {
+            // Suavizado temporal: amortigua jitter sin recalcular nada sobre frames antiguos.
             if (dispTemporalF.empty() || dispTemporalF.size() != dispF.size()) {
                 dispF.copyTo(dispTemporalF);
             } else {
@@ -399,12 +414,14 @@ int main(int argc, char** argv) {
         }
         cv::Mat points3D;
         if (!stereoProc.qMatrix.empty()) {
+            // La matriz Q transforma cada pixel + disparidad en un punto 3D (X, Y, Z).
             cv::reprojectImageTo3D(dispF, points3D, stereoProc.qMatrix, true);
         }
         double areaMin = minAreaTrack * 100.0;
         cv::Mat confidenceMap = stereoProc.getConfidenceMap();
         
         ++loop_idx;
+        // YOLO no se ejecuta en todos los frames para no matar el rendimiento.
         if (arYoloTrack == 1 && (loop_idx % 6 == 1 || cachedFaces.empty())) {
             cachedFaces = prepararRostrosParaAR(faceDetector.detect(vistaL, 0.35f), vistaL.size());
         }
@@ -412,9 +429,11 @@ int main(int argc, char** argv) {
         std::vector<Detection> faces = cachedFaces;
         cv::Rect objetoVisual = detectarObjetoOscuroRectangular(vistaL, areaMin, faces);
 
+        // Primero se forma una mascara de disparidades "basicamente validas".
         cv::Mat validDispMask = (dispF > 2.0f) & (dispF < 200.0f);
         cv::Mat confidenceMask;
         if (!confidenceMap.empty() && confidenceMap.size() == dispF.size()) {
+            // Si el WLS entrega confianza util en el centro, la usamos para endurecer la mascara.
             cv::inRange(confidenceMap, cv::Scalar(70.0f), cv::Scalar(255.0f), confidenceMask);
             cv::Mat strictMask = validDispMask & confidenceMask;
             cv::Rect centroPreview = roiCentralMedicion(stereoProc.imgSize);
@@ -424,6 +443,7 @@ int main(int argc, char** argv) {
         }
         cv::Mat confDispMask = mascaraConfianzaDisparidad(dispF, validDispMask);
         validDispMask &= confDispMask;
+        // Limpiamos bordes porque suelen contener errores geometricos de rectificacion/disparidad.
         int borderX = std::max(12, stereoProc.imgSize.width / 28);
         int borderY = std::max(8, stereoProc.imgSize.height / 40);
         validDispMask(cv::Rect(0, 0, borderX, validDispMask.rows)).setTo(0);
@@ -465,6 +485,7 @@ int main(int argc, char** argv) {
         cv::Rect objetoCentral;
         double distanciaCentralRawCm = -1.0;
 
+        // La region central es la ROI principal de medicion exigida por la rubrica.
         cv::Rect centro = roiCentralMedicion(stereoProc.imgSize);
         cv::Mat objetoCentroMask = mascaraPrimerPlanoCentral(dispF, centro, validDispMask);
         cv::Rect objetoCentroBox = cajaDesdeMascara(objetoCentroMask, 45);
@@ -473,6 +494,7 @@ int main(int argc, char** argv) {
         int numDispActual = numDispAuto == 0 ? 64 : (numDispAuto == 1 ? 128 : 192);
         double distanciaCentro = -1.0;
         if (!objetoCentroBox.empty()) {
+            // La distancia robusta combina Z de Q y formula estereo f*B/d dentro del mismo ROI.
             distanciaCentro = distanciaRobustaCm(
                 dispF, points3D, objetoCentroBox, objetoCentroMask,
                 stereoProc.focal_px, stereoProc.baseline_mm);
@@ -482,6 +504,7 @@ int main(int argc, char** argv) {
             objetoCentral = objetoCentroBox;
             distanciaCentralRawCm = distanciaCentro;
         } else if (modoCercaTrack == 0 && !points3D.empty()) {
+            // Fallback: si el centro no basto, se intenta encontrar un blob cercano por profundidad.
             cv::Rect depthBox;
             double depthMeanCm = -1.0;
             double depthThreshCm = std::clamp(static_cast<double>(depthThreshTrack), 20.0, 300.0);
@@ -495,6 +518,7 @@ int main(int argc, char** argv) {
         }
 
         if (modoCercaTrack == 0 && objetoCentral.empty() && !objetoVisual.empty()) {
+            // Segundo fallback: usa un objeto rectangular visual si la profundidad sola no segmenta bien.
             objetoCentral = objetoVisual;
             distanciaCentralRawCm = distanciaRobustaCm(
                 dispF, points3D, objetoVisual, validDispMask,
@@ -523,6 +547,7 @@ int main(int argc, char** argv) {
 
             char distBuf[64];
             if (distanciaCentralRawCm > 0) {
+                // Rechaza saltos imposibles antes de alimentar media movil y Kalman.
                 double referenciaCm = kalmanCentral.iniciado ? kalmanCentral.x : lastAcceptedDistanceCm;
                 bool plausible = medicionDistanciaPlausible(distanciaCentralRawCm, referenciaCm);
                 if (!plausible) {
@@ -543,6 +568,7 @@ int main(int argc, char** argv) {
                 lastRawDistanceCm = distanciaCentralRawCm;
                 lastAcceptedDistanceCm = distanciaCentralRawCm;
 
+                // La salida final mostrada al usuario es Z suavizada y escalada a centimetros reales.
                 double zSuavizadoRawCm = suavCentral.agregar(distanciaCentralRawCm);
                 double zKalmanRawCm = kalmanCentral.actualizar(zSuavizadoRawCm);
                 double zDisplayCm = zKalmanRawCm * stereoProc.scaleFactor;
@@ -564,6 +590,7 @@ int main(int argc, char** argv) {
 
         cv::Mat dispVis, dispNorm;
         double dMin = 0.0, dMax = 0.0;
+        // Para mostrar bien el mapa, se normaliza usando percentiles y no min/max crudos.
         cv::Mat dispBasicMask = (dispF > 1.0f) & (dispF < 200.0f);
         cv::Mat dispVisMask = dispBasicMask.clone();
         cv::Mat kernelVis = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 5));
@@ -588,12 +615,34 @@ int main(int argc, char** argv) {
         cv::morphologyEx(dispNorm, dispNorm, cv::MORPH_CLOSE, kernelClose);
         auto claheDisp = cv::createCLAHE(1.0, cv::Size(16, 16));
         claheDisp->apply(dispNorm, dispNorm);
-        cv::cvtColor(dispNorm, dispVis, cv::COLOR_GRAY2BGR);
-        dispVis.setTo(cv::Scalar(0,0,0), ~dispVisMask);
+        cv::Mat dispDisplayGray = dispNorm;
+        if (numDispActual > 0 && numDispActual < dispNorm.cols - 16) {
+            // La banda izquierda invalida por SGBM se recorta solo para visualizacion y luego se reescala.
+            cv::Rect validDispRoi(numDispActual, 0, dispNorm.cols - numDispActual, dispNorm.rows);
+            cv::Mat croppedDisp = dispNorm(validDispRoi);
+            cv::resize(croppedDisp, dispDisplayGray, dispNorm.size(), 0.0, 0.0, cv::INTER_LINEAR);
+        }
+        cv::cvtColor(dispDisplayGray, dispVis, cv::COLOR_GRAY2BGR);
 
         cv::Mat combined;
         std::vector<cv::Mat> panels = {canvas, dispVis};
         cv::hconcat(panels, combined);
+
+        // Mostrar FPS de las cámaras en la esquina superior derecha
+        double fpsL = camLeft.fps.load(std::memory_order_relaxed);
+        double fpsR = camRight.fps.load(std::memory_order_relaxed);
+        char fpsBuf[64];
+        snprintf(fpsBuf, sizeof(fpsBuf), "FPS L: %.1f  R: %.1f", fpsL, fpsR);
+        int fbBase = 0;
+        cv::Size fsz = cv::getTextSize(fpsBuf, cv::FONT_HERSHEY_SIMPLEX, 0.6, 2, &fbBase);
+        int pad = 6;
+        cv::rectangle(canvas,
+            cv::Point(canvas.cols - fsz.width - pad - 6, 6),
+            cv::Point(canvas.cols - 6, 6 + fsz.height + fbBase + 4),
+            cv::Scalar(0, 0, 0), -1);
+        cv::putText(canvas, fpsBuf, cv::Point(canvas.cols - fsz.width - 10, 6 + fsz.height),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(200, 220, 255), 2, cv::LINE_AA);
+
         cv::imshow("Camara Izquierda", canvas);
         cv::imshow("Mapa de Disparidad", dispVis);
         if (recordTrack == 1 && videoOut.isOpened()) videoOut.write(combined);
@@ -601,6 +650,7 @@ int main(int argc, char** argv) {
         int key = cv::waitKey(1);
         if (key == 'c' || key == 'C') {
             if (lastRawDistanceCm > 0) {
+                // Calibracion manual: corrige la escala global comparando medida real vs. medida calculada.
                 std::cout << "[CAL] Introduce distancia real en cm (ej: 50): ";
                 double real_cm = 0.0;
                 if (std::cin >> real_cm && real_cm > 0) {
@@ -626,6 +676,7 @@ int main(int argc, char** argv) {
         }
         if (key == 27) break;
         if (key == 's' || key == 'S') {
+            // Guarda exactamente lo que ve el usuario: vista a color anotada y mapa de disparidad mostrado.
             std::string n = "frame_" + std::to_string(frame_idx++);
             cv::imwrite(n + "_vision.png", canvas);
             cv::imwrite(n + "_depth.png",  dispVis);
@@ -633,6 +684,7 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Cierre ordenado: detiene captura, espera ambos hilos y cierra ventanas.
     camLeft.running  = false;
     camRight.running = false;
     if (threadLeft.joinable())  threadLeft.join();

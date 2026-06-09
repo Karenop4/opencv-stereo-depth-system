@@ -21,6 +21,7 @@ struct CameraStream {
     std::atomic<bool> running;
     std::atomic<bool> connected;
     std::atomic<long long> lastFrameUs;
+    std::atomic<double> fps;
 
     /**
      * @brief Construye un stream de cámara asociado a una URL HTTP.

@@ -16,7 +16,7 @@
  * @note Justificación: prepara flags atómicos y timestamp para capturar sin
  * bloquear el procesamiento estéreo principal.
  */
-CameraStream::CameraStream(std::string u) : url(u), running(true), connected(false), lastFrameUs(0) {}
+CameraStream::CameraStream(std::string u) : url(u), running(true), connected(false), lastFrameUs(0), fps(0.0) {}
 
 /**
  * @brief Solicita la detención del hilo de captura asociado.
@@ -29,6 +29,7 @@ CameraStream::~CameraStream() {
 }
 
 static bool open_capture(cv::VideoCapture& cap, const std::string& url) {
+    // Intentamos primero con FFMPEG y timeouts para que una camara caída no bloquee indefinidamente.
     const std::vector<int> params = {
         cv::CAP_PROP_OPEN_TIMEOUT_MSEC, 3000,
         cv::CAP_PROP_READ_TIMEOUT_MSEC, 3000
@@ -63,10 +64,14 @@ void capture_loop(CameraStream* cam) {
         }
         failCount = 0;
         std::cout << "[CAM] Conectada: " << cam->url << std::endl;
+        // Buffer de 1 frame: preferimos el frame mas reciente y no una cola vieja con retraso.
         cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
         cam->connected = true;
         cv::Mat tmp;
+        auto prev_tp = std::chrono::steady_clock::now();
+        double emaFps = 0.0;
         while (cam->running) {
+            // `grab()` recibe el siguiente JPEG del stream MJPEG, `retrieve()` lo decodifica.
             if (!cap.grab()) {
                 std::cerr << "[CAM] Se perdio la captura: " << cam->url << std::endl;
                 break;
@@ -76,10 +81,18 @@ void capture_loop(CameraStream* cam) {
                 break;
             }
             if (tmp.empty()) continue;
+            // Publica el frame bajo mutex porque el hilo principal puede leerlo al mismo tiempo.
             std::lock_guard<std::mutex> lock(cam->mtx);
             tmp.copyTo(cam->frame);
             const auto now = std::chrono::steady_clock::now().time_since_epoch();
             cam->lastFrameUs.store(std::chrono::duration_cast<std::chrono::microseconds>(now).count(), std::memory_order_relaxed);
+            // Estimacion suavizada de FPS: sirve para diagnosticar lag sin mostrar un numero nervioso.
+            auto now_tp = std::chrono::steady_clock::now();
+            double dt = std::chrono::duration_cast<std::chrono::microseconds>(now_tp - prev_tp).count() / 1e6;
+            prev_tp = now_tp;
+            double instFps = (dt > 1e-6) ? (1.0 / dt) : 0.0;
+            emaFps = emaFps * 0.92 + instFps * 0.08;
+            cam->fps.store(emaFps, std::memory_order_relaxed);
         }
         cap.release();
         cam->connected = false;

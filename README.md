@@ -1,329 +1,155 @@
 # Proyecto Integrador: Vision Estereo con ESP32-CAM, Profundidad y AR
 
-## Objetivo
-
-Este proyecto implementa un sistema de vision estereo en C++ con OpenCV para capturar dos streams ESP32-CAM, rectificarlos, calcular un mapa de disparidad denso, estimar distancia real en centimetros y superponer un efecto de realidad aumentada dinamico sobre la imagen a color.
-
-El ejecutable principal es `main_stereo`, construido desde:
-
-```make
-SRCS = main_stereo.cpp CameraStream.cpp StereoProcessor.cpp FaceSwapper.cpp YOLODetector.cpp
-```
-
-## Checklist de Rubrica
-
-| Criterio | Estado | Evidencia en el codigo |
-| --- | --- | --- |
-| Arquitectura de captura y hardware | Cumplido | `CameraStream` usa hilos para capturar ambas ESP32-CAM; `configure_esp32_cam()` ajusta AEC, AGC, brillo, contraste y XCLK. |
-| Calidad del mapa de disparidad | Cumplido | `StereoProcessor::computeDisparity()` usa CLAHE opcional, CUDA StereoSGM, filtro WLS, mediana y visualizacion con percentiles. |
-| Precision y estabilidad de distancia | Cumplido | `cv::reprojectImageTo3D()` usa `qMatrix`; tambien se valida con formula `Z = f * B / d`; la lectura pasa por media movil y Kalman 1D. |
-| Efecto AR | Cumplido | `FaceSwapper` realiza intercambio facial sobre la transmision a color. |
-| Defensa individual | Preparado | Este README resume que responder sobre Q, threads, locks, SGM, WLS, Kalman y calibracion. |
-
-## Flujo General del Sistema
-
-1. Se cargan calibracion y escala desde `parametros_stereo.yml` y `scale.yml`.
-2. Se configuran las ESP32-CAM con parametros de firmware.
-3. Se crean dos hilos, uno por camara, para capturar en paralelo.
-4. El hilo principal copia el ultimo frame valido de cada camara usando mutex.
-5. Se valida sincronizacion temporal comparando la edad de ambos frames.
-6. Las imagenes se redimensionan al tamano calibrado y se rectifican.
-7. Se calcula la disparidad con StereoSGM en GPU.
-8. Se filtra la disparidad con WLS y mediana para reducir ruido.
-9. Se reproyecta la disparidad a 3D con la matriz Q.
-10. Se detecta un objeto, se estima distancia y se estabiliza con media movil y Kalman.
-11. Se dibuja el efecto AR dinamico y el mapa de disparidad.
-
-## 1. Arquitectura de Captura y Hardware
-
-Archivos clave:
-
-- `CameraStream.hpp`
-- `CameraStream.cpp`
-- `main_stereo.cpp`
-
-Cada camara se representa con:
-
-- `url`: direccion del stream MJPEG.
-- `frame`: ultimo frame recibido.
-- `mtx`: mutex para proteger el acceso al frame.
-- `running`: bandera atomica para detener el hilo.
-- `connected`: bandera atomica de conexion.
-- `lastFrameUs`: timestamp monotono del ultimo frame.
-
-La funcion `capture_loop(CameraStream* cam)` corre en un hilo independiente por camara. Abre el stream con `cv::VideoCapture`, reduce el buffer con `CAP_PROP_BUFFERSIZE = 1`, captura frames y actualiza el ultimo frame bajo un `std::lock_guard<std::mutex>`.
-
-Esto reduce latencia porque el hilo principal no espera a que llegue un frame por red; siempre usa el ultimo frame disponible.
-
-La configuracion de firmware se hace con `configure_esp32_cam()`:
-
-- `aec`: auto-exposicion.
-- `aec2`: ajuste adicional de exposicion.
-- `agc`: auto-ganancia.
-- `gainceiling`: limite de ganancia.
-- `brightness` y `contrast`: ajuste base de imagen.
-- `xclk`: reloj estable para la camara.
-
-Respuesta oral sugerida:
-
-> Uso un hilo por camara para desacoplar red y procesamiento. El mutex protege el frame compartido, y los atomics permiten leer estados como `running`, `connected` y timestamp sin bloquear. Esto baja jitter porque el pipeline de disparidad no queda esperando I/O.
-
-## 2. Calidad del Mapa de Disparidad
-
-Archivo clave:
-
-- `StereoProcessor.cpp`
-
-La clase `StereoProcessor` concentra la parte estereo:
-
-- Carga matrices intrinsecas y extrinsecas.
-- Calcula o carga rectificacion.
-- Crea mapas de remapeo con `cv::initUndistortRectifyMap`.
-- Sube mapas a GPU.
-- Usa `cv::cuda::StereoSGM`.
-- Aplica filtro `cv::ximgproc::DisparityWLSFilter`.
-
-Preprocesamiento:
-
-- Se convierte BGR a gris.
-- Si `CLAHE` esta activo, se aplica `cv::cuda::createCLAHE(2.0, Size(8, 8))`.
-- CLAHE mejora contraste local y ayuda cuando la iluminacion no es uniforme.
-
-Algoritmo de disparidad:
-
-- Se usa StereoSGM en CUDA.
-- `numDisp` puede ser 64, 128 o 256.
-- `blockSz` se ajusta desde trackbar y se fuerza a impar.
-- `P1 = 8 * blockSize^2`.
-- `P2 = 32 * blockSize^2`.
-
-Posprocesamiento:
-
-- WLS suaviza zonas ruidosas conservando bordes.
-- `medianBlur` reduce speckles.
-- En la visualizacion se usan percentiles para evitar que outliers dominen el contraste.
-- Tambien se aplica filtro bilateral, cierre morfologico y CLAHE visual.
-
-Respuesta oral sugerida:
-
-> SGM calcula correspondencias densas buscando la mejor disparidad por pixel. CLAHE mejora textura antes del matching. WLS funciona como posfiltro guiado por la imagen izquierda: suaviza regiones planas, pero respeta discontinuidades de borde, por eso reduce ruido sin borrar contornos.
-
-## 3. Precision y Estabilidad de la Distancia
-
-Archivos clave:
-
-- `main_stereo.cpp`
-- `utils.hpp`
-- `StereoProcessor.cpp`
-
-La profundidad se obtiene por dos rutas:
-
-1. Reproyeccion 3D:
-
-```cpp
-cv::reprojectImageTo3D(dispF, points3D, stereoProc.qMatrix, true);
-```
-
-Luego se extrae Z desde `points3D` y se convierte de milimetros a centimetros.
-
-2. Formula estereo directa:
-
-```cpp
-Z = (focal_px * baseline_mm) / disparidad
-```
-
-En el codigo:
-
-```cpp
-zFromDispCm = (stereoProc.focal_px * stereoProc.baseline_mm) / dispMed / 10.0;
-```
-
-Se comparan ambas rutas. Si difieren demasiado, el sistema prioriza la medicion por disparidad para evitar una lectura incoherente.
-
-Estabilizacion:
-
-- `Suavizador`: media movil de 16 muestras.
-- `Kalman1D`: filtro de Kalman escalar.
-
-Media movil:
-
-```cpp
-promedio = suma(historial) / cantidad
-```
-
-Kalman 1D:
-
-```cpp
-p = p + q
-k = p / (p + r)
-x = x + k * (z - x)
-p = (1 - k) * p
-```
-
-Donde:
-
-- `x`: distancia estimada.
-- `z`: nueva medicion.
-- `p`: incertidumbre actual.
-- `q`: ruido de proceso.
-- `r`: ruido de medicion.
-- `k`: ganancia de Kalman.
-
-Tambien existe calibracion manual con tecla `C`. Si se conoce la distancia real, se calcula:
-
-```cpp
-scaleFactor = distancia_real_cm / distancia_medida_raw_cm
-```
-
-Respuesta oral sugerida:
-
-> La matriz Q transforma coordenadas de imagen y disparidad en coordenadas 3D. Para la distancia uso Z. Como la disparidad tiene ruido, tomo medianas dentro del ROI, rechazo valores invalidos, aplico media movil y finalmente Kalman 1D para que la lectura no fluctue mas de lo permitido.
-
-## 4. Efecto de Realidad Aumentada
-
-Archivos clave:
-
-- `FaceSwapper.hpp`
-- `FaceSwapper.cpp`
-- `YOLODetector.cpp`
-- `main_stereo.cpp`
-
-El AR tiene dos componentes:
-
-1. Deteccion facial con YOLO ONNX.
-2. Intercambio facial con dlib landmarks.
-
-`YOLODetector` carga `best.onnx` y devuelve cajas faciales. Si hay dos rostros, `FaceSwapper::swapFaces()`:
-
-- Obtiene landmarks de 68 puntos.
-- Calcula transformaciones afines.
-- Crea mascaras faciales.
-- Warpea cada cara hacia la otra.
-- Corrige color con especificacion de histograma.
-- Suaviza bordes con erosion y blur.
-- Compone el resultado sobre el frame.
-
-Respuesta oral sugerida:
-
-> El FaceSwap es el efecto visual original del proyecto. Detectamos rostros con YOLO, obtenemos landmarks con dlib y hacemos una transformacion afin para intercambiar las caras en tiempo real sobre la transmision a color.
-
-## 5. Matriz Q: Explicacion para Defensa
-
-La matriz Q viene de la calibracion estereo y permite convertir:
-
-```text
-(x, y, disparity, 1) -> (X, Y, Z, W)
-```
-
-Despues OpenCV normaliza por `W` y devuelve puntos 3D.
-
-Idea central:
-
-- Si la disparidad es grande, el objeto esta cerca.
-- Si la disparidad es pequena, el objeto esta lejos.
-- La profundidad depende de focal, baseline y disparidad.
-
-Formula conceptual:
-
-```text
-Z = f * B / d
-```
-
-Donde:
-
-- `f`: distancia focal en pixeles.
-- `B`: baseline entre camaras.
-- `d`: disparidad.
-- `Z`: profundidad.
-
-## 6. Preguntas Probables y Respuestas Cortas
-
-**Por que se usan dos hilos?**
-
-Para capturar ambas camaras en paralelo y evitar que la latencia de red bloquee el calculo de disparidad.
-
-**Por que se usa mutex?**
-
-Porque el hilo de captura escribe `frame` mientras el hilo principal lo lee. El mutex evita leer un frame a medio copiar.
-
-**Por que `lastFrameUs` es atomico?**
-
-Porque se lee desde el hilo principal y se escribe desde el hilo de captura sin necesitar bloquear.
-
-**Que hace CLAHE?**
-
-Mejora el contraste local. Ayuda a que SGM encuentre correspondencias en zonas con poca textura o iluminacion desigual.
-
-**Que hace WLS?**
-
-Filtra la disparidad usando informacion de bordes de la imagen guia. Reduce ruido y conserva contornos.
-
-**Por que se usa mediana en el ROI?**
-
-Porque la mediana es robusta ante outliers. Unos pocos pixeles malos no cambian drasticamente la distancia.
-
-**Por que Kalman y media movil?**
-
-La media movil amortigua ruido rapido. Kalman modela incertidumbre y produce una estimacion estable sin retrasar demasiado la respuesta.
-
-**Que pasa si hay frames desincronizados?**
-
-Se descartan si la edad supera 250 ms o si la diferencia entre camaras supera 90 ms, evitando disparidades falsas.
-
-**Por que se usa `scaleFactor`?**
-
-Para hacer un ajuste fino entre la medicion calculada y una distancia real conocida durante calibracion manual.
-
-**Que archivos son runtime obligatorio?**
-
-- `main_stereo`
-- `parametros_stereo.yml`
-- `scale.yml`
-- `shape_predictor_68_face_landmarks.dat`
-- `yolov26/runs/detect/yolov26_faces/weights/best.onnx`
-- `onnxruntime-linux-x64-1.18.0/lib/libonnxruntime.so.1.18.0`
-
-## 7. Archivos que No Entran al Ejecutable Principal
-
-Estos archivos pueden mantenerse como soporte, pero no forman parte de `main_stereo`:
-
-- `depth_map.cpp`: herramienta de calibracion, util si se necesita recalibrar.
-- `test_cuda.cpp`: prueba aislada de CUDA.
-- `inspect_onnx.py`: inspeccion del modelo.
-- `yolov26/train_faces.py`: entrenamiento.
-- `yolov26/export_onnx.py`: exportacion a ONNX.
-- `yolov26/auto_annotate.py`: apoyo para anotacion.
-- `.pt` y datasets: entrenamiento, no runtime.
-
-No deben agregarse al `SRCS` del Makefile final.
-
-## 8. Como Compilar y Ejecutar
-
-Compilar:
+## Resumen
+
+Este proyecto implementa un sistema de vision estereo en C++ con OpenCV que:
+
+- captura dos streams MJPEG desde dos ESP32-CAM en paralelo;
+- rectifica ambas vistas con una calibracion estereo;
+- calcula un mapa de disparidad denso con `StereoSGBM`;
+- filtra la disparidad con `WLS` y filtros espaciales;
+- reproyecta la disparidad a 3D con la matriz `Q`;
+- estima la distancia del objeto central en centimetros;
+- estabiliza la lectura con media movil y Kalman 1D;
+- aplica un efecto AR de intercambio facial sobre la imagen izquierda.
+
+El ejecutable principal es `main_stereo`.
+
+## Archivos Principales
+
+- [main_stereo.cpp](/home/user/Documentos/7mo%20ciclo/Vision_Computador/Proyecto/progC/main_stereo.cpp): orquestacion completa del pipeline.
+- [CameraStream.cpp](/home/user/Documentos/7mo%20ciclo/Vision_Computador/Proyecto/progC/CameraStream.cpp): captura concurrente y configuracion HTTP de las ESP32-CAM.
+- [StereoProcessor.cpp](/home/user/Documentos/7mo%20ciclo/Vision_Computador/Proyecto/progC/StereoProcessor.cpp): rectificacion, SGBM, WLS y conversion a disparidad float.
+- [DepthUtils.cpp](/home/user/Documentos/7mo%20ciclo/Vision_Computador/Proyecto/progC/DepthUtils.cpp): utilidades de confianza, ROI central, estadistica robusta y distancia.
+- [FaceSwapper.cpp](/home/user/Documentos/7mo%20ciclo/Vision_Computador/Proyecto/progC/FaceSwapper.cpp): efecto AR con landmarks de dlib.
+- [YOLODetector.cpp](/home/user/Documentos/7mo%20ciclo/Vision_Computador/Proyecto/progC/YOLODetector.cpp): deteccion facial con ONNX Runtime.
+- [GUIA_SUSTENTACION.md](/home/user/Documentos/7mo%20ciclo/Vision_Computador/Proyecto/progC/GUIA_SUSTENTACION.md): guia corta para repasar antes de exponer.
+
+## Compilacion
 
 ```bash
-make -B
+make
 ```
 
-Ejecutar:
+El `Makefile` compila actualmente:
+
+```make
+SRCS = main_stereo.cpp CameraStream.cpp StereoProcessor.cpp DepthUtils.cpp FaceSwapper.cpp YOLODetector.cpp
+```
+
+## Ejecucion
+
+Con URLs por defecto:
 
 ```bash
 ./main_stereo
 ```
 
-Controles:
+Con URLs manuales:
 
-- `Brillo`: compensacion visual.
-- `Contraste x10`: ganancia de contraste.
-- `CLAHE`: activa o desactiva preprocesamiento.
-- `Area min x100`: area minima del objeto.
-- `Num Disp`: 64, 128 o 256 disparidades.
-- `Block Size`: tamano de bloque SGM.
-- `Dist max cm`: distancia maxima para deteccion por profundidad.
-- `C`: calibracion manual de distancia.
-- `S`: guardar frame de vision y mapa de profundidad.
-- `ESC`: salir.
+```bash
+./main_stereo http://IP_IZQ:81/stream http://IP_DER:81/stream
+```
 
-## 9. Guion Corto para Presentacion
+## Flujo del Sistema
 
-> Nuestro sistema usa dos ESP32-CAM configuradas desde C++ para estabilizar exposicion, ganancia y reloj. Cada camara se lee en un hilo independiente, y el hilo principal procesa el ultimo frame sincronizado. Despues rectificamos con la calibracion estereo, calculamos disparidad con StereoSGM en CUDA, aplicamos CLAHE y WLS para mejorar densidad y reducir ruido, y reproyectamos a 3D con la matriz Q. La distancia se obtiene de Z y se valida tambien con la formula f por baseline dividido para disparidad. Para estabilizar la lectura usamos media movil y Kalman 1D. Finalmente, integramos un efecto AR original: intercambio facial en tiempo real.
+1. `main_stereo.cpp` crea `StereoProcessor`, `YOLODetector` y `FaceSwapper`.
+2. Se configuran ambas ESP32-CAM por HTTP con AEC, AGC y AWB desactivados.
+3. Se levanta un hilo por camara mediante `capture_loop()`.
+4. El hilo principal toma el ultimo frame disponible de cada stream.
+5. Si los frames estan demasiado viejos o desincronizados, se descartan.
+6. Las imagenes se ajustan al tamano calibrado y se rectifican.
+7. `StereoProcessor::computeDisparity()` calcula `dispF` con `StereoSGBM`.
+8. El resultado se filtra con `WLS`, mediana y filtros adicionales.
+9. `cv::reprojectImageTo3D()` usa `qMatrix` para generar `points3D`.
+10. `DepthUtils` extrae una distancia robusta en la ROI central.
+11. La distancia pasa por media movil, Kalman y `scaleFactor`.
+12. Se dibujan la vista izquierda, el mapa de disparidad y el FaceSwap.
+
+## Controles en la Interfaz
+
+- `Brillo`: desplaza intensidad de la rama de profundidad.
+- `Contraste x10`: ganancia de contraste aplicada antes de la disparidad.
+- `CLAHE`: activa o desactiva ecualizacion adaptativa previa al matching.
+- `WB software`: compensa el tinte verde si AWB esta apagado en firmware.
+- `Area min x100`: area minima usada en detectores auxiliares.
+- `Block Size`: tamano de bloque de `StereoSGBM`.
+- `Dist max cm`: umbral de profundidad para el fallback por nube 3D.
+- `AR YOLO`: activa el pipeline de deteccion facial y FaceSwap.
+- `Grabar`: guarda un AVI con imagen izquierda + disparidad.
+- `Modo cerca`: fuerza el uso de `192` disparidades para objetos cercanos.
+
+Teclas:
+
+- `C`: calibra `scaleFactor` con una distancia real conocida.
+- `S`: guarda la vista izquierda y el mapa de disparidad actual.
+- `ESC`: sale del programa.
+
+## Evidencia Frente a la Rubrica
+
+### 1. Arquitectura de captura y hardware
+
+- Hay un hilo por camara en `capture_loop()`.
+- Cada hilo publica el ultimo frame, su timestamp y un estimado de FPS.
+- `configure_esp32_cam()` fija controles del sensor antes del pipeline.
+- En `ESP32_CONTROLES` se documenta `aec=0`, `agc=0`, `awb=0` y `xclk`.
+
+### 2. Calidad del mapa de disparidad
+
+- El algoritmo base es `cv::StereoSGBM::create(...)`.
+- Se aplica CLAHE opcional en `StereoProcessor::computeDisparity()`.
+- Se usa `cv::ximgproc::createDisparityWLSFilter(...)`.
+- La visualizacion usa percentiles, bilateral, cierre morfologico y CLAHE visual.
+
+### 3. Precision y estabilidad de la distancia
+
+- `cv::reprojectImageTo3D(dispF, points3D, stereoProc.qMatrix, true)` usa explicitamente `Q`.
+- `DepthUtils::distanciaRobustaCm()` combina:
+  - `Z` de la nube 3D reproyectada;
+  - la formula estereo `Z = f * B / d`.
+- La distancia final mostrada se suaviza con `Suavizador` y `Kalman1D`.
+- `scaleFactor` permite calibracion metrica fina.
+
+### 4. Efecto AR
+
+- `YOLODetector` detecta rostros con ONNX.
+- `FaceSwapper` usa landmarks de dlib para el intercambio facial.
+- El resultado se dibuja sobre la imagen izquierda a color.
+
+## Respuestas Cortas para Sustentacion
+
+**Por que dos hilos?**
+
+Para desacoplar la red del procesamiento; cada ESP32-CAM puede retrasarse sin bloquear la otra ni congelar el pipeline estereo.
+
+**Por que mutex y atomics?**
+
+El mutex protege el `frame` mientras se copia. Los atomics permiten leer `running`, `connected`, `lastFrameUs` y `fps` sin bloqueo pesado.
+
+**Que hace la matriz Q?**
+
+Convierte coordenadas de imagen y disparidad en coordenadas 3D. De ahi se toma `Z` como profundidad real.
+
+**Que hace WLS?**
+
+Suaviza el mapa de disparidad guiandose por los bordes de la imagen izquierda; reduce ruido sin borrar contornos importantes.
+
+**Por que no basta con `Z = f * B / d`?**
+
+Porque la disparidad puntual puede tener outliers. Por eso se combinan estadisticas robustas, mascara de confianza y la nube 3D reproyectada.
+
+**Por que media movil y Kalman?**
+
+La media movil amortigua ruido rapido. El Kalman agrega memoria e incertidumbre para estabilizar sin volver la lectura demasiado lenta.
+
+## Dependencias de Runtime
+
+- `parametros_stereo.yml`
+- `scale.yml`
+- `shape_predictor_68_face_landmarks.dat`
+- `yolov26/runs/detect/yolov26_faces/weights/best.onnx`
+- ONNX Runtime en `onnxruntime-linux-x64-1.18.0/lib`
+
+## Nota Practica
+
+Antes de sustentar, conviene repasar [GUIA_SUSTENTACION.md](/home/user/Documentos/7mo%20ciclo/Vision_Computador/Proyecto/progC/GUIA_SUSTENTACION.md), porque resume el papel de cada archivo, las variables que suelen preguntar y un guion corto del flujo completo.
