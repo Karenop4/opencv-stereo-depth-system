@@ -5,7 +5,7 @@ OPENCV_LIBS = -lopencv_highgui -lopencv_videoio -lopencv_imgcodecs -lopencv_dnn 
 LDFLAGS = $(OPENCV_LDFLAGS) $(OPENCV_LIBS) -lpthread -ldlib -lblas -llapack -L./onnxruntime-linux-x64-1.18.0/lib -lonnxruntime -Wl,-rpath,'$$ORIGIN/onnxruntime-linux-x64-1.18.0/lib'
 
 TARGET = main_stereo
-SRCS = main_stereo.cpp CameraStream.cpp StereoProcessor.cpp FaceSwapper.cpp YOLODetector.cpp
+SRCS = main_stereo.cpp CameraStream.cpp StereoProcessor.cpp DepthUtils.cpp FaceSwapper.cpp YOLODetector.cpp
 
 .PHONY: all clean
 
