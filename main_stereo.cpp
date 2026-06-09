@@ -35,6 +35,8 @@ int depthThreshTrack = 120; // distancia maxima para objeto cercano en cm
 int arYoloTrack = 0;
 /** @brief Activa grabación de video; apagada por defecto para evitar lag. */
 int recordTrack = 0;
+/** @brief Prioriza la medición cercana que usa solo el componente central. */
+int modoCercaTrack = 1;
 
 /** @brief Parámetros de control enviados al firmware de la ESP32-CAM. */
 const std::vector<std::pair<std::string, int>> ESP32_CONTROLES = {
@@ -799,6 +801,7 @@ int main(int argc, char** argv) {
     cv::createTrackbar("Dist max cm",    "Ajustes Vision",     &depthThreshTrack, 300, nullptr);
     cv::createTrackbar("AR YOLO",        "Ajustes Vision",     &arYoloTrack,    1, nullptr);
     cv::createTrackbar("Grabar",         "Ajustes Vision",     &recordTrack,    1, nullptr);
+    cv::createTrackbar("Modo cerca",     "Ajustes Vision",     &modoCercaTrack, 1, nullptr);
 
     std::cout << "\n[CONTROLES]:" << std::endl;
     std::cout << "  Brillo/Contraste/CLAHE -> ajuste de luz" << std::endl;
@@ -881,7 +884,9 @@ int main(int argc, char** argv) {
         }
 
         double referenciaAutoCm = kalmanCentral.iniciado ? kalmanCentral.x : lastAcceptedDistanceCm;
-        numDispAuto = elegirModoDisparidadAuto(referenciaAutoCm, numDispAuto);
+        numDispAuto = (modoCercaTrack == 1)
+            ? 2
+            : elegirModoDisparidadAuto(referenciaAutoCm, numDispAuto);
         stereoProc.setSGBMParameters(numDispAuto, blockSz);
         
         cv::Mat dispFilt, dispF;
@@ -978,7 +983,7 @@ int main(int argc, char** argv) {
         if (distanciaCentro > 0) {
             objetoCentral = objetoCentroBox;
             distanciaCentralRawCm = distanciaCentro;
-        } else if (!points3D.empty()) {
+        } else if (modoCercaTrack == 0 && !points3D.empty()) {
             cv::Rect depthBox;
             double depthMeanCm = -1.0;
             double depthThreshCm = std::clamp(static_cast<double>(depthThreshTrack), 20.0, 300.0);
@@ -991,7 +996,7 @@ int main(int argc, char** argv) {
             }
         }
 
-        if (objetoCentral.empty() && !objetoVisual.empty()) {
+        if (modoCercaTrack == 0 && objetoCentral.empty() && !objetoVisual.empty()) {
             objetoCentral = objetoVisual;
             distanciaCentralRawCm = distanciaRobustaCm(
                 dispF, points3D, objetoVisual, validDispMask,
@@ -1004,8 +1009,8 @@ int main(int argc, char** argv) {
         double zMinCm = (stereoProc.focal_px * stereoProc.baseline_mm) /
                         std::max(1, numDispActual) / 10.0;
         char diagBuf[96];
-        snprintf(diagBuf, sizeof(diagBuf), "Disp P78: %.1f px | AutoDisp %d | Zmin %.0f cm",
-                 dispCentroPx, numDispActual, zMinCm);
+        snprintf(diagBuf, sizeof(diagBuf), "Disp P78: %.1f px | %s %d | Zmin %.0f cm",
+                 dispCentroPx, modoCercaTrack == 1 ? "CercaDisp" : "AutoDisp", numDispActual, zMinCm);
         cv::putText(canvas, diagBuf, {12, canvas.rows - 14},
                     cv::FONT_HERSHEY_SIMPLEX, 0.52, cv::Scalar(255, 220, 120), 2, cv::LINE_AA);
 
