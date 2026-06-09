@@ -28,6 +28,19 @@ CameraStream::~CameraStream() {
     running = false;
 }
 
+static bool open_capture(cv::VideoCapture& cap, const std::string& url) {
+    const std::vector<int> params = {
+        cv::CAP_PROP_OPEN_TIMEOUT_MSEC, 3000,
+        cv::CAP_PROP_READ_TIMEOUT_MSEC, 3000
+    };
+
+    if (cap.open(url, cv::CAP_FFMPEG, params)) return true;
+    cap.release();
+    if (cap.open(url, cv::CAP_FFMPEG)) return true;
+    cap.release();
+    return cap.open(url, cv::CAP_ANY);
+}
+
 /**
  * @brief Captura continuamente frames desde una ESP32-CAM.
  * @param cam Estado compartido de cámara donde se publica el último frame.
@@ -36,20 +49,32 @@ CameraStream::~CameraStream() {
  * baja latencia en rectificación, WLS y medición de distancia.
  */
 void capture_loop(CameraStream* cam) {
+    int failCount = 0;
     while (cam->running) {
         cv::VideoCapture cap;
-        cap.open(cam->url, cv::CAP_FFMPEG);
+        open_capture(cap, cam->url);
         if (!cap.isOpened()) {
             cam->connected = false;
+            ++failCount;
+            std::cerr << "[CAM] No se pudo abrir " << cam->url
+                      << " (intento " << failCount << "). Revisa IP, WiFi y endpoint /stream." << std::endl;
             std::this_thread::sleep_for(std::chrono::seconds(2));
             continue;
         }
+        failCount = 0;
+        std::cout << "[CAM] Conectada: " << cam->url << std::endl;
         cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
         cam->connected = true;
         cv::Mat tmp;
         while (cam->running) {
-            if (!cap.grab()) break;
-            cap.retrieve(tmp);
+            if (!cap.grab()) {
+                std::cerr << "[CAM] Se perdio la captura: " << cam->url << std::endl;
+                break;
+            }
+            if (!cap.retrieve(tmp)) {
+                std::cerr << "[CAM] No se pudo recuperar frame: " << cam->url << std::endl;
+                break;
+            }
             if (tmp.empty()) continue;
             std::lock_guard<std::mutex> lock(cam->mtx);
             tmp.copyTo(cam->frame);

@@ -1,187 +1,200 @@
-#include "StereoProcessor.hpp"
-#include <algorithm>
-#include <cmath>
-#include <cstdlib>
+#include "CameraStream.hpp"
+#include <chrono>
+#include <cstring>
 #include <iostream>
+#include <thread>
+#include <sstream>
+
+#include <netdb.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 /**
- * @brief Carga calibración estéreo, mapas de rectificación, SGM CUDA y WLS.
- * @param calibration_file YAML con intrínsecos, extrínsecos, proyecciones y Q.
- * @param scale_file YAML con factor de escala fino para la distancia final.
+ * @brief Inicializa el estado compartido de una cámara.
+ * @param u URL del stream MJPEG de la ESP32-CAM.
  * @return No devuelve valor.
- * @note Justificación: centraliza la calibración y deja listo el pipeline que
- * convierte disparidad en distancia métrica para la rúbrica de profundidad.
+ * @note Justificación: prepara flags atómicos y timestamp para capturar sin
+ * bloquear el procesamiento estéreo principal.
  */
-StereoProcessor::StereoProcessor(const std::string& calibration_file, const std::string& scale_file) 
-    : scaleFactor(1.0), imgSize(640, 480) {
-    
-    cv::FileStorage fs(calibration_file, cv::FileStorage::READ);
-    if (!fs.isOpened()) {
-        std::cerr << "[ERROR] No se encontró " << calibration_file << std::endl;
-        exit(-1);
-    }
-    cv::FileNode imageSizeNode = fs["imageSize"];
-    if (!imageSizeNode.empty()) {
-        imageSizeNode >> imgSize;
-        std::cout << "[INFO] imageSize from calibration: " << imgSize.width << "x" << imgSize.height << std::endl;
-    }
-    cv::Mat K1, K2, D1, D2, R, T, R1, R2, P1, P2, Q;
-    fs["K1"]>>K1; fs["D1"]>>D1;
-    fs["K2"]>>K2; fs["D2"]>>D2;
-    fs["R"] >>R;  fs["T"] >>T;
-    fs["R1"]>>R1; fs["R2"]>>R2;
-    fs["P1"]>>P1; fs["P2"]>>P2;
-    fs["Q"] >>Q;
-    fs.release();
+CameraStream::CameraStream(std::string u) : url(u), running(true), connected(false), lastFrameUs(0) {}
 
-    if (R1.empty() || R2.empty() || P1.empty() || P2.empty() || Q.empty()) {
-        cv::Rect validRoi[2];
-        cv::stereoRectify(K1, D1, K2, D2, imgSize, R, T,
-            R1, R2, P1, P2, Q,
-            cv::CALIB_ZERO_DISPARITY, 0, imgSize,
-            &validRoi[0], &validRoi[1]);
-        std::cout << "[INFO] Rectificacion calculada desde K/D/R/T" << std::endl;
-    } else {
-        std::cout << "[INFO] Rectificacion cargada desde calibracion" << std::endl;
-    }
-    qMatrix = Q.clone();
+/**
+ * @brief Solicita la detención del hilo de captura asociado.
+ * @param Ninguno.
+ * @return No devuelve valor.
+ * @note Justificación: permite cerrar recursos de cámara al salir de la demo.
+ */
+CameraStream::~CameraStream() {
+    running = false;
+}
 
-    focal_px = std::abs(P1.at<double>(0, 0));
-    baseline_mm = 0.0;
-    if (!P2.empty() && std::abs(P2.at<double>(0, 0)) > 1e-9) {
-        baseline_mm = std::abs(P2.at<double>(0, 3) / P2.at<double>(0, 0));
-        std::cout << "[INFO] Baseline from P2: " << baseline_mm << " (same units as calibration)" << std::endl;
-    }
-    if (baseline_mm <= 0.0 && !Q.empty() && std::abs(Q.at<double>(3, 2)) > 1e-9) {
-        baseline_mm = std::abs(1.0 / Q.at<double>(3, 2));
-        std::cout << "[INFO] Baseline from Q fallback: " << baseline_mm << " (same units as calibration)" << std::endl;
-    }
-    if (baseline_mm <= 0.0 && !T.empty() && T.total() >= 3) {
-        baseline_mm = cv::norm(T);
-        std::cout << "[INFO] Baseline from T fallback: " << baseline_mm << " (same units as calibration)" << std::endl;
-    }
-    std::cout << "[INFO] Focal:    " << focal_px << " px" << std::endl;
+static bool open_capture(cv::VideoCapture& cap, const std::string& url) {
+    const std::vector<int> params = {
+        cv::CAP_PROP_OPEN_TIMEOUT_MSEC, 3000,
+        cv::CAP_PROP_READ_TIMEOUT_MSEC, 3000
+    };
 
-    cv::Mat mapL1, mapL2, mapR1, mapR2;
-    cv::initUndistortRectifyMap(K1,D1,R1,P1,imgSize,CV_32FC1,mapL1,mapL2);
-    cv::initUndistortRectifyMap(K2,D2,R2,P2,imgSize,CV_32FC1,mapR1,mapR2);
-    
-    d_mapL1.upload(mapL1); d_mapL2.upload(mapL2);
-    d_mapR1.upload(mapR1); d_mapR2.upload(mapR2);
+    if (cap.open(url, cv::CAP_FFMPEG, params)) return true;
+    cap.release();
+    if (cap.open(url, cv::CAP_FFMPEG)) return true;
+    cap.release();
+    return cap.open(url, cv::CAP_ANY);
+}
 
-    int initNumDisp = std::max(1, 6) * 16;
-    int blockSz = 7;
-    int p1 = 24 * 1 * blockSz * blockSz;
-    int p2 = 96 * 1 * blockSz * blockSz;
-    d_sgm = cv::cuda::createStereoSGM(0, initNumDisp, p1, p2, 5, cv::cuda::StereoSGM::MODE_HH);
-    
-    wls = cv::ximgproc::createDisparityWLSFilterGeneric(false);
-    wls->setLambda(8000.0);
-    wls->setSigmaColor(1.5);
-
-    cv::FileStorage sfs(scale_file, cv::FileStorage::READ);
-    if (sfs.isOpened()) {
-        double sf = 1.0; sfs["scaleFactor"] >> sf;
-        if (sf > 0) { scaleFactor = sf; std::cout << "[INFO] scaleFactor loaded: " << scaleFactor << std::endl; }
-        sfs.release();
-    } else {
-        std::cout << "[INFO] scaleFactor default: " << scaleFactor
-                  << " (calibracion en mm; usa C solo para ajuste fino)" << std::endl;
+/**
+ * @brief Captura continuamente frames desde una ESP32-CAM.
+ * @param cam Estado compartido de cámara donde se publica el último frame.
+ * @return No devuelve valor.
+ * @note Justificación: desacopla I/O de red del cálculo estéreo para mantener
+ * baja latencia en rectificación, WLS y medición de distancia.
+ */
+void capture_loop(CameraStream* cam) {
+    int failCount = 0;
+    while (cam->running) {
+        cv::VideoCapture cap;
+        open_capture(cap, cam->url);
+        if (!cap.isOpened()) {
+            cam->connected = false;
+            ++failCount;
+            std::cerr << "[CAM] No se pudo abrir " << cam->url
+                      << " (intento " << failCount << "). Revisa IP, WiFi y endpoint /stream." << std::endl;
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            continue;
+        }
+        failCount = 0;
+        std::cout << "[CAM] Conectada: " << cam->url << std::endl;
+        cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
+        cam->connected = true;
+        cv::Mat tmp;
+        while (cam->running) {
+            if (!cap.grab()) {
+                std::cerr << "[CAM] Se perdio la captura: " << cam->url << std::endl;
+                break;
+            }
+            if (!cap.retrieve(tmp)) {
+                std::cerr << "[CAM] No se pudo recuperar frame: " << cam->url << std::endl;
+                break;
+            }
+            if (tmp.empty()) continue;
+            std::lock_guard<std::mutex> lock(cam->mtx);
+            tmp.copyTo(cam->frame);
+            const auto now = std::chrono::steady_clock::now().time_since_epoch();
+            cam->lastFrameUs.store(std::chrono::duration_cast<std::chrono::microseconds>(now).count(), std::memory_order_relaxed);
+        }
+        cap.release();
+        cam->connected = false;
     }
 }
 
 /**
- * @brief Actualiza los parámetros del matcher SGM CUDA si cambiaron.
- * @param numDispMult Selector de rango de disparidad: 0=64, 1=128, 2=256.
- * @param blockSz Tamaño de bloque solicitado desde la interfaz.
- * @return No devuelve valor.
- * @note Justificación: permite ajustar calidad/ruido durante la demo sin
- * reiniciar la aplicación ni perder la calibración cargada.
+ * @brief Separa host y puerto desde una URL HTTP.
+ * @param url URL de entrada con esquema http://.
+ * @param host Salida con el host o IP.
+ * @param port Salida con el puerto; usa 80 si no viene especificado.
+ * @return true si la URL pudo parsearse.
+ * @note Justificación: permite enviar comandos de exposición/ganancia al
+ * firmware sin depender de librerías HTTP externas pesadas.
  */
-void StereoProcessor::setSGBMParameters(int numDispMult, int blockSz) {
-    int selector = std::clamp(numDispMult, 0, 2);
-    int nd = selector == 0 ? 64 : (selector == 1 ? 128 : 256);
-    int bs = std::max(3, blockSz%2==0 ? blockSz+1 : blockSz);
-    
-    if (nd != last_nd || bs != last_bs) {
-        int p1 = 24 * 1 * bs * bs;
-        int p2 = 96 * 1 * bs * bs;
-        try {
-            auto next = cv::cuda::createStereoSGM(0, nd, p1, p2, 5, cv::cuda::StereoSGM::MODE_HH);
-            d_sgm = next;
-            last_nd = nd;
-            last_bs = bs;
-            std::cout << "[INFO] StereoSGM actualizado: numDisp=" << nd << " blockSz=" << bs << std::endl;
-        } catch (const cv::Exception& e) {
-            std::cerr << "[WARN] No se pudo actualizar StereoSGM (se conserva la configuracion anterior): "
-                      << e.what() << std::endl;
+static bool parse_http_url(const std::string& url, std::string& host, std::string& port) {
+    const std::string prefix = "http://";
+    if (url.rfind(prefix, 0) != 0) return false;
+
+    size_t start = prefix.size();
+    size_t slash = url.find('/', start);
+    std::string authority = url.substr(start, slash == std::string::npos ? std::string::npos : slash - start);
+    size_t colon = authority.find(':');
+    if (colon == std::string::npos) {
+        host = authority;
+        port = "80";
+    } else {
+        host = authority.substr(0, colon);
+        port = authority.substr(colon + 1);
+    }
+    return !host.empty() && !port.empty();
+}
+
+/**
+ * @brief Ejecuta una petición HTTP GET mínima contra la ESP32-CAM.
+ * @param host Host o IP de la cámara.
+ * @param port Puerto HTTP de control.
+ * @param path Ruta de control con variable y valor.
+ * @return true si la cámara responde con código 200.
+ * @note Justificación: fija parámetros ópticos antes de procesar profundidad,
+ * reduciendo cambios de iluminación que degradan el mapa de disparidad.
+ */
+static bool http_get_control(const std::string& host, const std::string& port, const std::string& path) {
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    addrinfo* result = nullptr;
+    if (getaddrinfo(host.c_str(), port.c_str(), &hints, &result) != 0) return false;
+
+    int sock = -1;
+    for (addrinfo* rp = result; rp != nullptr; rp = rp->ai_next) {
+        sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (sock == -1) continue;
+
+        timeval timeout{};
+        timeout.tv_sec = 1;
+        timeout.tv_usec = 500000;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
+        if (connect(sock, rp->ai_addr, rp->ai_addrlen) == 0) break;
+        close(sock);
+        sock = -1;
+    }
+    freeaddrinfo(result);
+    if (sock == -1) return false;
+
+    std::ostringstream req;
+    req << "GET " << path << " HTTP/1.1\r\n"
+        << "Host: " << host << "\r\n"
+        << "Connection: close\r\n\r\n";
+    std::string request = req.str();
+
+    bool ok = send(sock, request.c_str(), request.size(), 0) == static_cast<ssize_t>(request.size());
+    if (ok) {
+        char buffer[128];
+        ssize_t n = recv(sock, buffer, sizeof(buffer) - 1, 0);
+        if (n > 0) {
+            buffer[n] = '\0';
+            ok = std::strstr(buffer, "200") != nullptr;
+        } else {
+            ok = false;
         }
     }
+    close(sock);
+    return ok;
 }
 
 /**
- * @brief Rectifica ambas imágenes usando mapas precalculados en GPU.
- * @param imgLeft Imagen izquierda original.
- * @param imgRight Imagen derecha original.
- * @param rectL Salida rectificada izquierda.
- * @param rectR Salida rectificada derecha.
- * @return No devuelve valor.
- * @note Justificación: alinea epipolares para que la disparidad horizontal sea
- * válida y la reproyección 3D con Q produzca profundidad coherente.
+ * @brief Configura variables del firmware de una ESP32-CAM.
+ * @param streamUrl URL del stream usado para deducir host de control.
+ * @param controls Lista de pares variable/valor.
+ * @return true si todos los comandos recibieron respuesta HTTP 200.
+ * @note Justificación: estabiliza exposición, ganancia y reloj de cámara antes
+ * de estimar profundidad, mejorando consistencia entre vistas izquierda/derecha.
  */
-void StereoProcessor::rectifyImages(const cv::Mat& imgLeft, const cv::Mat& imgRight, cv::Mat& rectL, cv::Mat& rectR) {
-    cv::cuda::GpuMat d_imgL(imgLeft), d_imgR(imgRight);
-    cv::cuda::GpuMat d_rectL, d_rectR;
-    
-    cv::cuda::remap(d_imgL, d_rectL, d_mapL1, d_mapL2, cv::INTER_LINEAR);
-    cv::cuda::remap(d_imgR, d_rectR, d_mapR1, d_mapR2, cv::INTER_LINEAR);
-    
-    d_rectL.download(rectL);
-    d_rectR.download(rectR);
-}
+bool configure_esp32_cam(const std::string& streamUrl, const std::vector<std::pair<std::string, int>>& controls) {
+    std::string host, port;
+    if (!parse_http_url(streamUrl, host, port)) return false;
 
-/**
- * @brief Calcula mapa de disparidad, aplica WLS y entrega escala float.
- * @param rectL Imagen izquierda rectificada.
- * @param rectR Imagen derecha rectificada.
- * @param claheTrack Activa CLAHE para mejorar contraste local si vale 1.
- * @param dispFilt Salida WLS/mediana en formato de disparidad fijo.
- * @param dispF Salida en CV_32F, dividida entre 16 para cálculos métricos.
- * @return No devuelve valor.
- * @note Justificación: el filtro WLS reduce ruido y conserva bordes, condición
- * crítica para estimar distancias y mostrar un mapa de disparidad de calidad.
- */
-void StereoProcessor::computeDisparity(const cv::Mat& rectL, const cv::Mat& rectR, int claheTrack, cv::Mat& dispFilt, cv::Mat& dispF) {
-    cv::cuda::GpuMat d_rectL(rectL), d_rectR(rectR);
-    cv::cuda::GpuMat d_gL, d_gR;
-    
-    cv::cuda::cvtColor(d_rectL, d_gL, cv::COLOR_BGR2GRAY);
-    cv::cuda::cvtColor(d_rectR, d_gR, cv::COLOR_BGR2GRAY);
-
-    // --- REQUISITO RÚBRICA: PREPROCESADO E HIGIENIZACIÓN DE BORDES ---
-    // 1. Un filtro de nitidez (Laplaciano o Sobel suave) ayuda a que SGBM encuentre contornos definidos
-    cv::cuda::GpuMat d_edgeL, d_edgeR;
-    cv::cuda::bilateralFilter(d_gL, d_edgeL, 9, 75.0, 75.0);
-    cv::cuda::bilateralFilter(d_gR, d_edgeR, 9, 75.0, 75.0);
-    d_gL = d_edgeL;
-    d_gR = d_edgeR;
-
-    if (claheTrack == 1) {
-        auto d_clahe = cv::cuda::createCLAHE(1.0, cv::Size(16, 16));
-        d_clahe->apply(d_gL, d_gL);
-        d_clahe->apply(d_gR, d_gR);
+    bool allOk = true;
+    for (const auto& [var, val] : controls) {
+        std::ostringstream path;
+        path << "/control?var=" << var << "&val=" << val;
+        bool ok = http_get_control(host, "80", path.str());
+        allOk = allOk && ok;
+        std::cout << "[ESP32] " << host << " " << var << "=" << val
+                  << (ok ? " OK" : " sin respuesta") << std::endl;
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
     }
 
-    cv::cuda::GpuMat d_disp;
-    d_sgm->compute(d_gL, d_gR, d_disp);
-    
-    cv::Mat dispL, gL;
-    d_disp.download(dispL);
-    d_gL.download(gL);
-    
-    cv::Mat dispR; 
-    wls->filter(dispL, gL, dispFilt, dispR);
-
-    if (!dispFilt.empty()) cv::medianBlur(dispFilt, dispFilt, 5);
-    dispFilt.convertTo(dispF, CV_32F, 1.0/16.0);
+    if (port != "81") {
+        std::cout << "[ESP32] Stream usando puerto " << port
+                  << "; controles enviados al puerto HTTP 80." << std::endl;
+    }
+    return allOk;
 }

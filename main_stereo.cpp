@@ -20,26 +20,45 @@ int brilloTrack  = 100;  // 100 = 0 compensación
 /** @brief Ganancia de contraste en escala x10. */
 int contTrack    = 10;   // 10  = 1.0x multiplicador
 /** @brief Activa el preprocesado CLAHE antes de la disparidad. */
-int claheTrack   = 1;    // 1   = Activado
+int claheTrack   = 0;    // 1   = Activado
+/** @brief Activa balance de blancos por software para compensar tinte verde. */
+int wbSoftTrack  = 1;    // 1   = Activado
 /** @brief Área mínima de objeto expresada en centenas de píxeles. */
 int minAreaTrack = 5;    // área mínima x100 px²
-/** @brief Selector de 64/128/256 disparidades. */
-int numDispMult  = 1;   // 0=64, 1=128, 2=256
+/** @brief Selector automatico de 64/128/192 disparidades. */
+int numDispAuto  = 1;   // 128 cubre ~33 cm y evita el recorte fuerte de 192
 /** @brief Tamaño de bloque de la SGM. */
-int blockSz      = 7;
+int blockSz      = 11;
 /** @brief Umbral máximo de distancia para objetos cercanos. */
 int depthThreshTrack = 120; // distancia maxima para objeto cercano en cm
+/** @brief Activa YOLO/FaceSwap; apagarlo ayuda a calibrar profundidad sin lag. */
+int arYoloTrack = 0;
+/** @brief Activa grabación de video; apagada por defecto para evitar lag. */
+int recordTrack = 0;
 
 /** @brief Parámetros de control enviados al firmware de la ESP32-CAM. */
 const std::vector<std::pair<std::string, int>> ESP32_CONTROLES = {
-    {"aec", 1},          // auto-exposicion activa para evitar imagen quemada
-    {"aec2", 1},
-    {"ae_level", -1},
-    {"agc", 1},          // auto-ganancia activa; el suavizado se hace por software
-    {"gainceiling", 1},
-    {"brightness", -1},
+    {"aec", 0},          // AEC desactivado: paridad luminica entre sensores
+    {"aec2", 0},
+    {"aec_value", 450},  // exposicion manual inicial; ajustar si la imagen queda oscura
+    {"ae_level", 0},
+    {"agc", 0},          // AGC desactivado: evita saltos de ganancia por camara
+    {"agc_gain", 8},     // ganancia manual moderada para bajar ruido respecto a AGC
+    {"awb", 0},          // AWB desactivado: color/iluminacion estables
+    {"awb_gain", 0},
+    {"wb_mode", 0},
+    {"hmirror", 0},
+    {"vflip", 0},
+    {"gainceiling", 0},
+    {"brightness", 0},
     {"contrast", 0},
-    {"xclk", 20}         // firmware personalizado: XCLK estable a 20 MHz
+    {"saturation", 0},
+    {"bpc", 1},
+    {"wpc", 1},
+    {"raw_gma", 1},
+    {"lenc", 1},
+    {"dcw", 1},
+    {"xclk", 20}         // uso normal: 20 MHz; documentar prueba a 6 MHz en firmware/informe
 };
 
 /**
@@ -54,6 +73,32 @@ static void asegurarTamanoCalibrado(cv::Mat& img, const cv::Size& size) {
     if (!img.empty() && img.size() != size) {
         cv::resize(img, img, size, 0, 0, cv::INTER_AREA);
     }
+}
+
+/**
+ * @brief Corrige dominante de color con balance gray-world acotado.
+ * @param src Imagen BGR de entrada.
+ * @param dst Imagen BGR corregida.
+ * @return No devuelve valor.
+ * @note Compensa el tinte verde producido al bloquear AWB en firmware, sin
+ * reactivar automatismos del sensor que romperían la paridad temporal.
+ */
+static void balanceBlancosGrayWorld(const cv::Mat& src, cv::Mat& dst) {
+    if (src.empty() || src.channels() != 3) {
+        src.copyTo(dst);
+        return;
+    }
+
+    cv::Scalar meanBgr = cv::mean(src);
+    double gray = (meanBgr[0] + meanBgr[1] + meanBgr[2]) / 3.0;
+    std::vector<cv::Mat> channels;
+    cv::split(src, channels);
+    for (int i = 0; i < 3; ++i) {
+        double gain = gray / std::max(1.0, meanBgr[i]);
+        gain = std::clamp(gain, 0.65, 1.55);
+        channels[i].convertTo(channels[i], -1, gain, 0.0);
+    }
+    cv::merge(channels, dst);
 }
 
 /**
@@ -204,6 +249,9 @@ static double edadFrameMs(const CameraStream& cam) {
     return static_cast<double>(ahoraUs() - stamp) / 1000.0;
 }
 
+static float medianaDisparidadConMascara(const cv::Mat& dispF, const cv::Rect& roi, const cv::Mat& mask);
+static float percentilDisparidadConMascara(const cv::Mat& dispF, const cv::Rect& roi, const cv::Mat& mask, double percentile);
+
 /**
  * @brief Genera una máscara de confianza de disparidad a partir de la mediana local.
  * @param dispF Mapa de disparidad en float.
@@ -226,6 +274,92 @@ static cv::Mat mascaraConfianzaDisparidad(const cv::Mat& dispF, const cv::Mat& v
     cv::morphologyEx(diffMask, diffMask, cv::MORPH_OPEN, kernel);
     cv::morphologyEx(diffMask, diffMask, cv::MORPH_CLOSE, kernel);
     return diffMask;
+}
+
+/**
+ * @brief Construye una máscara de primer plano dentro de la ROI central.
+ * @param dispF Mapa de disparidad.
+ * @param roi ROI de búsqueda.
+ * @param validMask Máscara de disparidades válidas.
+ * @return Máscara global del componente cercano más centrado.
+ * @note Evita que la distancia central se vaya al fondo cuando el objeto no
+ * llena toda la ROI, una causa común de lecturas aparentemente invertidas.
+ */
+static cv::Mat mascaraPrimerPlanoCentral(const cv::Mat& dispF, const cv::Rect& roi, const cv::Mat& validMask) {
+    cv::Mat out = cv::Mat::zeros(dispF.size(), CV_8U);
+    cv::Rect safe = roi & cv::Rect(0, 0, dispF.cols, dispF.rows);
+    if (safe.empty()) return out;
+
+    float p60 = percentilDisparidadConMascara(dispF, safe, validMask, 0.60);
+    float p90 = percentilDisparidadConMascara(dispF, safe, validMask, 0.90);
+    if (p60 <= 0 || p90 <= 0 || p90 <= p60) return out;
+
+    float threshold = p60 + 0.20f * (p90 - p60);
+    cv::Mat localDisp = dispF(safe);
+    cv::Mat localValid = validMask(safe);
+    cv::Mat localMask = (localDisp >= threshold) & localValid;
+
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
+    cv::morphologyEx(localMask, localMask, cv::MORPH_OPEN, kernel);
+    cv::morphologyEx(localMask, localMask, cv::MORPH_CLOSE, kernel);
+
+    cv::Mat labels, stats, centroids;
+    int n = cv::connectedComponentsWithStats(localMask, labels, stats, centroids, 8, CV_32S);
+    if (n <= 1) return out;
+
+    cv::Point2d center(safe.width * 0.5, safe.height * 0.5);
+    int bestLabel = -1;
+    double bestScore = -1.0;
+    for (int label = 1; label < n; ++label) {
+        int area = stats.at<int>(label, cv::CC_STAT_AREA);
+        if (area < std::max(40, safe.area() / 80)) continue;
+        cv::Point2d c(centroids.at<double>(label, 0), centroids.at<double>(label, 1));
+        double dist = cv::norm(c - center) / std::max(safe.width, safe.height);
+        double score = area / (1.0 + 5.0 * dist);
+        if (score > bestScore) {
+            bestScore = score;
+            bestLabel = label;
+        }
+    }
+
+    if (bestLabel < 0) return out;
+    cv::Mat selected = labels == bestLabel;
+    selected.copyTo(out(safe));
+    return out;
+}
+
+/**
+ * @brief Elimina componentes pequeños de una máscara binaria.
+ * @param mask Máscara de entrada.
+ * @param minArea Área mínima de componente.
+ * @return Máscara filtrada.
+ * @note Reduce speckles visuales que no representan superficies coherentes.
+ */
+static cv::Mat filtrarComponentesPequenos(const cv::Mat& mask, int minArea) {
+    cv::Mat clean = cv::Mat::zeros(mask.size(), CV_8U);
+    if (mask.empty()) return clean;
+
+    cv::Mat labels, stats, centroids;
+    int n = cv::connectedComponentsWithStats(mask, labels, stats, centroids, 8, CV_32S);
+    for (int label = 1; label < n; ++label) {
+        int area = stats.at<int>(label, cv::CC_STAT_AREA);
+        if (area >= minArea) clean.setTo(255, labels == label);
+    }
+    return clean;
+}
+
+/**
+ * @brief Devuelve la caja envolvente de una máscara si tiene área suficiente.
+ * @param mask Máscara global del objeto.
+ * @param minArea Área mínima requerida.
+ * @return Bounding box o rectángulo vacío.
+ * @note Se usa para dibujar solo objetos detectados, no la ROI fija central.
+ */
+static cv::Rect cajaDesdeMascara(const cv::Mat& mask, int minArea) {
+    std::vector<cv::Point> pts;
+    cv::findNonZero(mask, pts);
+    if (static_cast<int>(pts.size()) < minArea) return {};
+    return cv::boundingRect(pts);
 }
 
 /**
@@ -257,6 +391,39 @@ static float medianaDisparidadConMascara(const cv::Mat& dispF, const cv::Rect& r
 }
 
 /**
+ * @brief Percentil alto de disparidad para priorizar el objeto cercano en la ROI.
+ * @param dispF Mapa de disparidad en píxeles.
+ * @param roi Región de medición.
+ * @param mask Máscara de disparidades válidas.
+ * @param percentile Percentil en rango 0..1.
+ * @return Disparidad robusta en píxeles o -1 si no hay muestras.
+ * @note En una ROI central puede mezclarse objeto y fondo; un percentil alto
+ * toma el primer plano, que es lo esperado para medir el objeto colocado al centro.
+ */
+static float percentilDisparidadConMascara(const cv::Mat& dispF, const cv::Rect& roi, const cv::Mat& mask, double percentile) {
+    cv::Rect safe = roi & cv::Rect(0, 0, dispF.cols, dispF.rows);
+    if (safe.empty()) return -1.0f;
+
+    cv::Mat region = dispF(safe);
+    cv::Mat maskRegion = mask(safe);
+    std::vector<float> vals;
+    vals.reserve(safe.area());
+    for (int y = 0; y < region.rows; ++y) {
+        const float* d = region.ptr<float>(y);
+        const uchar* m = maskRegion.ptr<uchar>(y);
+        for (int x = 0; x < region.cols; ++x) {
+            if (m[x] && d[x] > 2.0f && d[x] < 200.0f) vals.push_back(d[x]);
+        }
+    }
+
+    if (vals.size() < 8) return -1.0f;
+    size_t idx = std::min(vals.size() - 1,
+        static_cast<size_t>(std::clamp(percentile, 0.0, 1.0) * (vals.size() - 1)));
+    std::nth_element(vals.begin(), vals.begin() + idx, vals.end());
+    return vals[idx];
+}
+
+/**
  * @brief Calcula la mediana Z válida usando la función auxiliar con expansión.
  * @param points3D Nube de puntos reproyectada.
  * @param roi Región de interés.
@@ -265,6 +432,117 @@ static float medianaDisparidadConMascara(const cv::Mat& dispF, const cv::Rect& r
  */
 static double medianaZValida(const cv::Mat& points3D, const cv::Rect& roi) {
     return medianaZValidaImpl(points3D, roi, true, 0);
+}
+
+/**
+ * @brief ROI central usada para medir el objeto situado frente al sistema.
+ * @param size Tamaño del frame rectificado.
+ * @return Caja central proporcional al campo de visión.
+ * @note La rúbrica pide enfocar la métrica en el objeto colocado en el centro,
+ * por eso esta región tiene prioridad sobre detectores visuales auxiliares.
+ */
+static cv::Rect roiCentralMedicion(const cv::Size& size) {
+    int w = std::max(70, size.width / 8);
+    int h = std::max(60, size.height / 8);
+    return cv::Rect((size.width - w) / 2, (size.height - h) / 2, w, h);
+}
+
+/**
+ * @brief Elige automáticamente el rango de disparidad necesario.
+ * @param distanciaEstableCm Última distancia filtrada disponible.
+ * @param modoActual Modo actual: 0=64, 1=128, 2=192.
+ * @return Nuevo modo con histéresis para evitar cambios constantes.
+ * @note Permite medir cerca sin que el usuario tenga que cambiar NumDisp,
+ * pero baja el coste cuando el objeto está lejos y estable.
+ */
+static int elegirModoDisparidadAuto(double distanciaEstableCm, int modoActual) {
+    if (!std::isfinite(distanciaEstableCm) || distanciaEstableCm <= 0.0) {
+        return 1;
+    }
+
+    if (modoActual == 2) {
+        if (distanciaEstableCm > 44.0) return 1;
+        return 2;
+    }
+    if (modoActual == 1) {
+        if (distanciaEstableCm < 32.0) return 2;
+        if (distanciaEstableCm > 145.0) return 0;
+        return 1;
+    }
+    if (distanciaEstableCm < 115.0) return 1;
+    return 0;
+}
+
+/**
+ * @brief Rechaza saltos de distancia incompatibles con un objeto estático.
+ * @param medicionCm Medición nueva.
+ * @param referenciaCm Última distancia aceptada o filtrada.
+ * @return true si la medición se considera plausible.
+ * @note Evita fluctuaciones grandes causadas por speckles o cambios de ROI.
+ */
+static bool medicionDistanciaPlausible(double medicionCm, double referenciaCm) {
+    if (!std::isfinite(medicionCm) || medicionCm <= 0.0) return false;
+    if (!std::isfinite(referenciaCm) || referenciaCm <= 0.0) return true;
+
+    double saltoMax = std::max(7.0, 0.10 * referenciaCm);
+    return std::abs(medicionCm - referenciaCm) <= saltoMax;
+}
+
+/**
+ * @brief Calcula distancia robusta dentro de una ROI combinando Q y disparidad.
+ * @param dispF Mapa de disparidad en píxeles.
+ * @param points3D Nube reproyectada con la matriz Q.
+ * @param roi Región a medir.
+ * @param validDispMask Máscara de disparidades confiables.
+ * @param focalPx Focal de la cámara rectificada.
+ * @param baselineMm Línea base en milímetros.
+ * @return Distancia en centímetros o -1 si no existe lectura válida.
+ * @note Mantiene explícita la reproyección 3D con Q y usa la fórmula de
+ * disparidad como comprobación robusta ante huecos locales.
+ */
+static double distanciaRobustaCm(
+    const cv::Mat& dispF,
+    const cv::Mat& points3D,
+    const cv::Rect& roi,
+    const cv::Mat& validDispMask,
+    double focalPx,
+    double baselineMm)
+{
+    cv::Rect safe = roi & cv::Rect(0, 0, dispF.cols, dispF.rows);
+    if (safe.empty()) return -1.0;
+
+    cv::Rect inner(
+        safe.x + safe.width / 6,
+        safe.y + safe.height / 6,
+        std::max(1, safe.width * 2 / 3),
+        std::max(1, safe.height * 2 / 3));
+
+    cv::Mat fgMask = mascaraPrimerPlanoCentral(dispF, safe, validDispMask);
+    const cv::Mat& measureMask = (cv::countNonZero(fgMask(safe)) >= 8) ? fgMask : validDispMask;
+
+    float dispMed = percentilDisparidadConMascara(dispF, inner, measureMask, 0.65);
+    if (dispMed <= 0) dispMed = percentilDisparidadConMascara(dispF, safe, measureMask, 0.65);
+    if (dispMed <= 0) dispMed = medianaDisparidadConMascara(dispF, inner, validDispMask);
+    if (dispMed <= 0) dispMed = medianaDisparidadConMascara(dispF, safe, validDispMask);
+
+    double zFromDispCm = -1.0;
+    if (dispMed > 0) {
+        zFromDispCm = (focalPx * baselineMm) / dispMed / 10.0;
+    }
+
+    double zFromPointsCm = -1.0;
+    if (!points3D.empty()) {
+        zFromPointsCm = medianaZValida(points3D, inner);
+        if (zFromPointsCm <= 0) zFromPointsCm = medianaZValida(points3D, safe);
+        if (zFromPointsCm > 0) zFromPointsCm /= 10.0;
+    }
+
+    if (zFromDispCm > 0 && zFromPointsCm > 0) {
+        double relDiff = std::abs(zFromDispCm - zFromPointsCm) / std::max(1.0, zFromDispCm);
+        return (relDiff > 0.35) ? zFromDispCm : 0.5 * (zFromDispCm + zFromPointsCm);
+    }
+    if (zFromDispCm > 0) return zFromDispCm;
+    return zFromPointsCm;
 }
 
 /**
@@ -481,14 +759,24 @@ static bool detectarObjetoPorProfundidad(
  * @return 0 si la ejecución termina correctamente.
  * @note Orquesta captura concurrente, filtrado estéreo, calibración y el efecto AR.
  */
-int main() {
+int main(int argc, char** argv) {
     StereoProcessor stereoProc("parametros_stereo.yml", "scale.yml");
     
     YOLODetector faceDetector("yolov26/runs/detect/yolov26_faces/weights/best.onnx");
     FaceSwapper faceSwapper("shape_predictor_68_face_landmarks.dat");
 
-    const std::string leftUrl  = "http://192.168.137.168:81/stream";
-    const std::string rightUrl = "http://192.168.137.46:81/stream";
+    std::string leftUrl  = "http://192.168.18.44:81/stream";
+    std::string rightUrl = "http://192.168.18.43:81/stream";
+    if (argc >= 3) {
+        leftUrl = argv[1];
+        rightUrl = argv[2];
+    } else {
+        std::cout << "[INFO] Uso: ./main_stereo <url_izquierda> <url_derecha>" << std::endl;
+        std::cout << "[INFO] Usando URLs por defecto del codigo." << std::endl;
+    }
+    std::cout << "[INFO] Camara izquierda: " << leftUrl << std::endl;
+    std::cout << "[INFO] Camara derecha:   " << rightUrl << std::endl;
+
     configure_esp32_cam(leftUrl, ESP32_CONTROLES);
     configure_esp32_cam(rightUrl, ESP32_CONTROLES);
 
@@ -505,15 +793,17 @@ int main() {
     cv::createTrackbar("Brillo",        "Ajustes Luz",       &brilloTrack,  200, nullptr);
     cv::createTrackbar("Contraste x10", "Ajustes Luz",       &contTrack,     30, nullptr);
     cv::createTrackbar("CLAHE",         "Ajustes Luz",       &claheTrack,     1, nullptr);
+    cv::createTrackbar("WB software",   "Ajustes Luz",       &wbSoftTrack,    1, nullptr);
     cv::createTrackbar("Area min x100", "Ajustes Vision",     &minAreaTrack, 150, nullptr);
-    cv::createTrackbar("Num Disp",       "Ajustes Vision",     &numDispMult,    2, nullptr);
     cv::createTrackbar("Block Size",     "Ajustes Vision",     &blockSz,       15, nullptr);
     cv::createTrackbar("Dist max cm",    "Ajustes Vision",     &depthThreshTrack, 300, nullptr);
+    cv::createTrackbar("AR YOLO",        "Ajustes Vision",     &arYoloTrack,    1, nullptr);
+    cv::createTrackbar("Grabar",         "Ajustes Vision",     &recordTrack,    1, nullptr);
 
     std::cout << "\n[CONTROLES]:" << std::endl;
     std::cout << "  Brillo/Contraste/CLAHE -> ajuste de luz" << std::endl;
     std::cout << "  Area min x100 -> tamaño minimo de objeto" << std::endl;
-    std::cout << "  Num Disp      -> 64 / 128 / 256" << std::endl;
+    std::cout << "  Num Disp      -> automatico 64 / 128 / 192" << std::endl;
     std::cout << "  Dist max cm   -> umbral de objeto cercano" << std::endl;
     std::cout << "  FaceSwap      -> automatico con 2 rostros YOLO" << std::endl;
     std::cout << "  [C]           -> calibrar distancia actual" << std::endl;
@@ -523,11 +813,16 @@ int main() {
     cv::VideoWriter videoOut("salida_stereo.avi", cv::VideoWriter::fourcc('M','J','P','G'), 10.0, cv::Size(stereoProc.imgSize.width * 2, stereoProc.imgSize.height));
 
     cv::Mat imgLeft, imgRight;
-    Suavizador suavCentral(16);
-    Kalman1D kalmanCentral(0.05, 4.0);
+    Suavizador suavCentral(24);
+    Kalman1D kalmanCentral(0.03, 9.0);
     int frame_idx = 0;
+    int loop_idx = 0;
     double lastRawDistanceCm = -1.0;
+    double lastAcceptedDistanceCm = -1.0;
+    int rejectedDistanceCount = 0;
     bool faceSwapWarned = false;
+    std::vector<Detection> cachedFaces;
+    cv::Mat dispTemporalF;
 
     while (true) {
         lastRawDistanceCm = -1.0;
@@ -536,31 +831,45 @@ int main() {
         if (okL) { std::lock_guard<std::mutex> l(camLeft.mtx);  camLeft.frame.copyTo(imgLeft);   }
         if (okR) { std::lock_guard<std::mutex> l(camRight.mtx); camRight.frame.copyTo(imgRight); }
 
+        if (!okL || !okR) {
+            cv::Mat w = cv::Mat::zeros(130, 560, CV_8UC3);
+            cv::putText(w, "Esperando camaras...", {10,45},
+                cv::FONT_HERSHEY_SIMPLEX, 0.85, cv::Scalar(0,200,255), 2);
+            cv::putText(w, okL ? "Izquierda: OK" : "Izquierda: sin frame", {10,82},
+                cv::FONT_HERSHEY_SIMPLEX, 0.65, okL ? cv::Scalar(0,255,0) : cv::Scalar(0,0,255), 2);
+            cv::putText(w, okR ? "Derecha: OK" : "Derecha: sin frame", {10,112},
+                cv::FONT_HERSHEY_SIMPLEX, 0.65, okR ? cv::Scalar(0,255,0) : cv::Scalar(0,0,255), 2);
+            cv::imshow("Camara Izquierda", w);
+            if (cv::waitKey(30) == 27) break;
+            continue;
+        }
+
         double ageL = edadFrameMs(camLeft);
         double ageR = edadFrameMs(camRight);
         double syncDelta = std::abs(ageL - ageR);
-        if (ageL > 250.0 || ageR > 250.0 || syncDelta > 90.0) {
+        if (ageL > 700.0 || ageR > 700.0 || syncDelta > 180.0) {
             std::cerr << "[WARN] Frames desincronizados o viejos: L=" << ageL
                       << " ms, R=" << ageR << " ms, delta=" << syncDelta << " ms" << std::endl;
             if (cv::waitKey(1) == 27) break;
             continue;
         }
 
-        if (!okL || !okR) {
-            cv::Mat w = cv::Mat::zeros(100, 400, CV_8UC3);
-            cv::putText(w, "Esperando camaras...", {10,55},
-                cv::FONT_HERSHEY_SIMPLEX, 0.85, cv::Scalar(0,200,255), 2);
-            cv::imshow("Camara Izquierda", w);
-            if (cv::waitKey(30) == 27) break;
-            continue;
-        }
-
         asegurarTamanoCalibrado(imgLeft, stereoProc.imgSize);
         asegurarTamanoCalibrado(imgRight, stereoProc.imgSize);
 
+        cv::Mat frameLeft = imgLeft;
+        cv::Mat frameRight = imgRight;
+        cv::Mat wbLeft, wbRight;
+        if (wbSoftTrack == 1) {
+            balanceBlancosGrayWorld(frameLeft, wbLeft);
+            balanceBlancosGrayWorld(frameRight, wbRight);
+            frameLeft = wbLeft;
+            frameRight = wbRight;
+        }
+
         cv::Mat rectL, rectR;
-        stereoProc.rectifyImages(imgLeft, imgRight, rectL, rectR);
-        cv::Mat vistaL = imgLeft.clone();
+        stereoProc.rectifyImages(frameLeft, frameRight, rectL, rectR);
+        cv::Mat vistaL = frameLeft.clone();
         cv::Mat procL = rectL.clone();
         cv::Mat procR = rectR.clone();
 
@@ -571,20 +880,45 @@ int main() {
             procR.convertTo(procR, -1, alphaC, betaB);
         }
 
-        stereoProc.setSGBMParameters(numDispMult, blockSz);
+        double referenciaAutoCm = kalmanCentral.iniciado ? kalmanCentral.x : lastAcceptedDistanceCm;
+        numDispAuto = elegirModoDisparidadAuto(referenciaAutoCm, numDispAuto);
+        stereoProc.setSGBMParameters(numDispAuto, blockSz);
         
         cv::Mat dispFilt, dispF;
         stereoProc.computeDisparity(procL, procR, claheTrack, dispFilt, dispF);
+        if (!dispF.empty()) {
+            if (dispTemporalF.empty() || dispTemporalF.size() != dispF.size()) {
+                dispF.copyTo(dispTemporalF);
+            } else {
+                cv::addWeighted(dispF, 0.32, dispTemporalF, 0.68, 0.0, dispTemporalF);
+                dispTemporalF.copyTo(dispF);
+            }
+        }
         cv::Mat points3D;
         if (!stereoProc.qMatrix.empty()) {
             cv::reprojectImageTo3D(dispF, points3D, stereoProc.qMatrix, true);
         }
         double areaMin = minAreaTrack * 100.0;
+        cv::Mat confidenceMap = stereoProc.getConfidenceMap();
         
-        std::vector<Detection> faces = prepararRostrosParaAR(faceDetector.detect(vistaL, 0.35f), vistaL.size());
+        ++loop_idx;
+        if (arYoloTrack == 1 && (loop_idx % 6 == 1 || cachedFaces.empty())) {
+            cachedFaces = prepararRostrosParaAR(faceDetector.detect(vistaL, 0.35f), vistaL.size());
+        }
+        if (arYoloTrack == 0) cachedFaces.clear();
+        std::vector<Detection> faces = cachedFaces;
         cv::Rect objetoVisual = detectarObjetoOscuroRectangular(vistaL, areaMin, faces);
 
         cv::Mat validDispMask = (dispF > 2.0f) & (dispF < 200.0f);
+        cv::Mat confidenceMask;
+        if (!confidenceMap.empty() && confidenceMap.size() == dispF.size()) {
+            cv::inRange(confidenceMap, cv::Scalar(70.0f), cv::Scalar(255.0f), confidenceMask);
+            cv::Mat strictMask = validDispMask & confidenceMask;
+            cv::Rect centroPreview = roiCentralMedicion(stereoProc.imgSize);
+            if (cv::countNonZero(strictMask(centroPreview)) >= 24) {
+                validDispMask = strictMask;
+            }
+        }
         cv::Mat confDispMask = mascaraConfianzaDisparidad(dispF, validDispMask);
         validDispMask &= confDispMask;
         int borderX = std::max(12, stereoProc.imgSize.width / 28);
@@ -594,86 +928,86 @@ int main() {
         validDispMask(cv::Rect(0, 0, validDispMask.cols, borderY)).setTo(0);
         validDispMask(cv::Rect(0, validDispMask.rows - borderY, validDispMask.cols, borderY)).setTo(0);
         cv::Mat canvas = vistaL.clone();
-        std::vector<cv::Rect> rostrosSwap = seleccionarRostrosSwap(faces);
-        bool faceSwapActivo = false;
-        if (rostrosSwap.size() == 2) {
-            try {
-                faceSwapper.swapFaces(canvas, rostrosSwap[0], rostrosSwap[1]);
-                faceSwapActivo = true;
-            } catch (const cv::Exception& e) {
-                if (!faceSwapWarned) {
-                    std::cerr << "[WARN] FaceSwap no pudo aplicarse con las cajas YOLO actuales: "
-                              << e.what() << std::endl;
-                    faceSwapWarned = true;
+        if (arYoloTrack == 1) {
+            std::vector<cv::Rect> rostrosSwap = seleccionarRostrosSwap(faces);
+            bool faceSwapActivo = false;
+            if (rostrosSwap.size() == 2) {
+                try {
+                    faceSwapper.swapFaces(canvas, rostrosSwap[0], rostrosSwap[1]);
+                    faceSwapActivo = true;
+                } catch (const cv::Exception& e) {
+                    if (!faceSwapWarned) {
+                        std::cerr << "[WARN] FaceSwap no pudo aplicarse con las cajas YOLO actuales: "
+                                  << e.what() << std::endl;
+                        faceSwapWarned = true;
+                    }
+                    for (const auto& f : faces) {
+                        cv::rectangle(canvas, f.box, cv::Scalar(0, 255, 0), 2);
+                    }
                 }
+            } else {
                 for (const auto& f : faces) {
                     cv::rectangle(canvas, f.box, cv::Scalar(0, 255, 0), 2);
                 }
             }
-        } else {
-            for (const auto& f : faces) {
-                cv::rectangle(canvas, f.box, cv::Scalar(0, 255, 0), 2);
-            }
-        }
 
-        const std::string faceStatus = faceSwapActivo
-            ? "FaceSwap YOLO: ON"
-            : "FaceSwap YOLO: " + std::to_string(faces.size()) + "/2 rostros";
-        cv::putText(canvas, faceStatus, {12, 24}, cv::FONT_HERSHEY_SIMPLEX, 0.6,
-                    faceSwapActivo ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 200, 255),
-                    2, cv::LINE_AA);
+            const std::string faceStatus = faceSwapActivo
+                ? "FaceSwap YOLO: ON"
+                : "FaceSwap YOLO: " + std::to_string(faces.size()) + "/2 rostros";
+            cv::putText(canvas, faceStatus, {12, 24}, cv::FONT_HERSHEY_SIMPLEX, 0.6,
+                        faceSwapActivo ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 200, 255),
+                        2, cv::LINE_AA);
+        }
 
         cv::Rect objetoCentral;
         double distanciaCentralRawCm = -1.0;
 
-        if (!faces.empty()) {
-            objetoCentral = faces[0].box;
-        } else if (!objetoVisual.empty()) {
-            objetoCentral = objetoVisual;
+        cv::Rect centro = roiCentralMedicion(stereoProc.imgSize);
+        cv::Mat objetoCentroMask = mascaraPrimerPlanoCentral(dispF, centro, validDispMask);
+        cv::Rect objetoCentroBox = cajaDesdeMascara(objetoCentroMask, 45);
+        float dispCentroPx = percentilDisparidadConMascara(dispF, centro, validDispMask, 0.78);
+        if (dispCentroPx <= 0) dispCentroPx = medianaDisparidadConMascara(dispF, centro, validDispMask);
+        int numDispActual = numDispAuto == 0 ? 64 : (numDispAuto == 1 ? 128 : 192);
+        double distanciaCentro = -1.0;
+        if (!objetoCentroBox.empty()) {
+            distanciaCentro = distanciaRobustaCm(
+                dispF, points3D, objetoCentroBox, objetoCentroMask,
+                stereoProc.focal_px, stereoProc.baseline_mm);
         }
 
-        if (!objetoCentral.empty() && !points3D.empty()) {
-            cv::Rect roiInner(
-                objetoCentral.x + objetoCentral.width / 5,
-                objetoCentral.y + objetoCentral.height / 5,
-                std::max(1, objetoCentral.width * 3 / 5),
-                std::max(1, objetoCentral.height * 3 / 5));
-            float dispMed = medianaDisparidadConMascara(dispF, roiInner, validDispMask);
-            if (dispMed <= 0) dispMed = medianaDisparidadConMascara(dispF, objetoCentral, validDispMask);
-
-            double zFromDispCm = -1.0;
-            if (dispMed > 0) {
-                zFromDispCm = (stereoProc.focal_px * stereoProc.baseline_mm) / dispMed / 10.0;
-            }
-
-            double zFromPointsCm = medianaZValida(points3D, roiInner);
-            if (zFromPointsCm <= 0) zFromPointsCm = medianaZValida(points3D, objetoCentral);
-            if (zFromPointsCm > 0) zFromPointsCm /= 10.0;
-
-            if (zFromDispCm > 0 && zFromPointsCm > 0) {
-                double relDiff = std::abs(zFromDispCm - zFromPointsCm) / std::max(1.0, zFromDispCm);
-                if (relDiff > 0.35) {
-                    std::cerr << "[WARN] Profundidad inconsistente entre disparidad y reproyeccion; usando disparidad." << std::endl;
-                    distanciaCentralRawCm = zFromDispCm;
-                } else {
-                    distanciaCentralRawCm = 0.5 * (zFromDispCm + zFromPointsCm);
-                }
-            } else if (zFromDispCm > 0) {
-                distanciaCentralRawCm = zFromDispCm;
-            } else if (zFromPointsCm > 0) {
-                distanciaCentralRawCm = zFromPointsCm;
-            }
-        }
-
-        if (objetoCentral.empty() && !points3D.empty()) {
+        if (distanciaCentro > 0) {
+            objetoCentral = objetoCentroBox;
+            distanciaCentralRawCm = distanciaCentro;
+        } else if (!points3D.empty()) {
             cv::Rect depthBox;
             double depthMeanCm = -1.0;
             double depthThreshCm = std::clamp(static_cast<double>(depthThreshTrack), 20.0, 300.0);
             if (detectarObjetoPorProfundidad(points3D, depthThreshCm, areaMin, depthBox, depthMeanCm)) {
                 objetoCentral = depthBox;
-                distanciaCentralRawCm = depthMeanCm;
+                distanciaCentralRawCm = distanciaRobustaCm(
+                    dispF, points3D, depthBox, validDispMask,
+                    stereoProc.focal_px, stereoProc.baseline_mm);
+                if (distanciaCentralRawCm <= 0) distanciaCentralRawCm = depthMeanCm;
             }
         }
+
+        if (objetoCentral.empty() && !objetoVisual.empty()) {
+            objetoCentral = objetoVisual;
+            distanciaCentralRawCm = distanciaRobustaCm(
+                dispF, points3D, objetoVisual, validDispMask,
+                stereoProc.focal_px, stereoProc.baseline_mm);
+        }
+
+        cv::Point centerPt(centro.x + centro.width / 2, centro.y + centro.height / 2);
+        cv::drawMarker(canvas, centerPt, cv::Scalar(255, 180, 0), cv::MARKER_CROSS, 16, 1, cv::LINE_AA);
+        numDispActual = numDispAuto == 0 ? 64 : (numDispAuto == 1 ? 128 : 192);
+        double zMinCm = (stereoProc.focal_px * stereoProc.baseline_mm) /
+                        std::max(1, numDispActual) / 10.0;
+        char diagBuf[96];
+        snprintf(diagBuf, sizeof(diagBuf), "Disp P78: %.1f px | AutoDisp %d | Zmin %.0f cm",
+                 dispCentroPx, numDispActual, zMinCm);
+        cv::putText(canvas, diagBuf, {12, canvas.rows - 14},
+                    cv::FONT_HERSHEY_SIMPLEX, 0.52, cv::Scalar(255, 220, 120), 2, cv::LINE_AA);
 
         if (!objetoCentral.empty()) {
             cv::Rect box = objetoCentral & cv::Rect(0, 0, canvas.cols, canvas.rows);
@@ -686,19 +1020,25 @@ int main() {
 
             char distBuf[64];
             if (distanciaCentralRawCm > 0) {
-                lastRawDistanceCm = distanciaCentralRawCm;
-
-                // Si hay salto brusco de distancia, reinicia filtros para evitar que se queden anclados.
-                if (kalmanCentral.iniciado) {
-                    double delta = std::abs(distanciaCentralRawCm - kalmanCentral.x);
-                    double salto = std::max(10.0, 0.25 * std::max(1.0, kalmanCentral.x));
-                    if (delta > salto) {
+                double referenciaCm = kalmanCentral.iniciado ? kalmanCentral.x : lastAcceptedDistanceCm;
+                bool plausible = medicionDistanciaPlausible(distanciaCentralRawCm, referenciaCm);
+                if (!plausible) {
+                    ++rejectedDistanceCount;
+                    if (rejectedDistanceCount < 4 && lastAcceptedDistanceCm > 0) {
+                        distanciaCentralRawCm = lastAcceptedDistanceCm;
+                    } else {
                         suavCentral.hist.clear();
                         kalmanCentral.iniciado = false;
                         kalmanCentral.x = 0.0;
                         kalmanCentral.p = 1.0;
+                        rejectedDistanceCount = 0;
                     }
+                } else {
+                    rejectedDistanceCount = 0;
                 }
+
+                lastRawDistanceCm = distanciaCentralRawCm;
+                lastAcceptedDistanceCm = distanciaCentralRawCm;
 
                 double zSuavizadoRawCm = suavCentral.agregar(distanciaCentralRawCm);
                 double zKalmanRawCm = kalmanCentral.actualizar(zSuavizadoRawCm);
@@ -721,7 +1061,16 @@ int main() {
 
         cv::Mat dispVis, dispNorm;
         double dMin = 0.0, dMax = 0.0;
-        cv::Mat dispVisMask = validDispMask.clone();
+        cv::Mat dispBasicMask = (dispF > 1.0f) & (dispF < 200.0f);
+        cv::Mat dispVisMask = dispBasicMask.clone();
+        cv::Mat kernelVis = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 5));
+        cv::morphologyEx(dispVisMask, dispVisMask, cv::MORPH_OPEN, kernelVis);
+        cv::morphologyEx(dispVisMask, dispVisMask, cv::MORPH_CLOSE, kernelVis);
+        dispVisMask = filtrarComponentesPequenos(dispVisMask, 260);
+        if (static_cast<size_t>(cv::countNonZero(dispVisMask)) < dispF.total() / 80) {
+            dispVisMask = dispBasicMask;
+            cv::morphologyEx(dispVisMask, dispVisMask, cv::MORPH_CLOSE, kernelVis);
+        }
         if (!rangoDisparidadPercentil(dispF, dispVisMask, 0.02, 0.90, dMin, dMax)) {
             cv::minMaxLoc(dispF, &dMin, &dMax, nullptr, nullptr, dispVisMask);
         }
@@ -734,7 +1083,6 @@ int main() {
         dispNorm = dispSmooth;
         cv::Mat kernelClose = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 5));
         cv::morphologyEx(dispNorm, dispNorm, cv::MORPH_CLOSE, kernelClose);
-        cv::morphologyEx(dispVisMask, dispVisMask, cv::MORPH_CLOSE, kernelClose);
         auto claheDisp = cv::createCLAHE(1.0, cv::Size(16, 16));
         claheDisp->apply(dispNorm, dispNorm);
         cv::cvtColor(dispNorm, dispVis, cv::COLOR_GRAY2BGR);
@@ -745,7 +1093,7 @@ int main() {
         cv::hconcat(panels, combined);
         cv::imshow("Camara Izquierda", canvas);
         cv::imshow("Mapa de Disparidad", dispVis);
-        if (videoOut.isOpened()) videoOut.write(combined);
+        if (recordTrack == 1 && videoOut.isOpened()) videoOut.write(combined);
 
         int key = cv::waitKey(1);
         if (key == 'c' || key == 'C') {
