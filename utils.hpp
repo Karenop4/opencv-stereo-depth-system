@@ -11,9 +11,8 @@
  * Mantiene las últimas N lecturas y devuelve su media para amortiguar
  * fluctuaciones frame a frame.
  *
- * @note Justificación: esta media móvil estabiliza la distancia mostrada y
- * evita saltos visuales, requisito clave para una lectura de profundidad
- * defendible durante la presentación.
+ * @note Esta media móvil estabiliza la distancia mostrada y
+ * evita saltos visuales en la lectura de profundidad.
  */
 struct Suavizador {
     std::deque<double> hist;
@@ -23,7 +22,7 @@ struct Suavizador {
      * @brief Construye el suavizador temporal.
      * @param n Número máximo de muestras usadas por la media móvil.
      * @return No devuelve valor.
-     * @note Justificación: limitar la ventana mantiene baja latencia sin perder
+     * @note Limitar la ventana mantiene baja latencia sin perder
      * estabilidad en la distancia estimada.
      */
     Suavizador(int n = 12) : maxN(n) {}
@@ -32,7 +31,7 @@ struct Suavizador {
      * @brief Agrega una medición y devuelve la media móvil actual.
      * @param val Distancia nueva en centímetros, o valor negativo si no hay lectura.
      * @return Distancia suavizada; -1 si aún no existen muestras válidas.
-     * @note Justificación: conserva la última lectura válida cuando un frame
+     * @note Conserva la última lectura válida cuando un frame
      * puntual falla, reduciendo parpadeos en la salida AR.
      */
     double agregar(double val) {
@@ -51,7 +50,7 @@ struct Suavizador {
  * Modela la distancia como una señal escalar con incertidumbre de proceso y
  * medición configurables.
  *
- * @note Justificación: filtra ruido residual de SGM/WLS y mejora la estabilidad
+ * @note Filtra ruido residual de SGM/WLS y mejora la estabilidad
  * métrica requerida para la estimación de profundidad.
  */
 struct Kalman1D {
@@ -66,7 +65,7 @@ struct Kalman1D {
      * @param processNoise Ruido esperado en la evolución de la distancia.
      * @param measurementNoise Ruido esperado en cada medición estéreo.
      * @return No devuelve valor.
-     * @note Justificación: permite ajustar respuesta contra suavidad sin tocar
+     * @note Permite ajustar respuesta contra suavidad sin tocar
      * la calibración ni el filtro WLS.
      */
     Kalman1D(double processNoise = 0.08, double measurementNoise = 5.5)
@@ -76,7 +75,7 @@ struct Kalman1D {
      * @brief Actualiza el estado del filtro con una nueva medición.
      * @param z Distancia medida en centímetros.
      * @return Distancia filtrada; -1 si todavía no existe estado válido.
-     * @note Justificación: convierte lecturas ruidosas en una distancia estable
+     * @note Convierte lecturas ruidosas en una distancia estable
      * para la interfaz y para la calibración manual con la tecla C.
      */
     double actualizar(double z) {

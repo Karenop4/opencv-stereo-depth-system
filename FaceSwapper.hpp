@@ -14,6 +14,10 @@
  * @details
  * Se usa como efecto AR complementario para aportar una capa visual original
  * y reactiva sobre la escena capturada.
+ *
+ * @note Efecto/filtro adaptado tomando como referencia
+ * https://github.com/MishaPrigara/FaceSwap; la integracion con YOLO y el
+ * flujo estereo corresponde a este proyecto.
  */
 class FaceSwapper {
 public:
@@ -29,7 +33,7 @@ public:
      * @brief Libera recursos del intercambiador facial.
      * @param Ninguno.
      * @return No devuelve valor.
-     * @note Justificación: mantiene una interfaz explícita para liberar el
+     * @note Mantiene una interfaz explícita para liberar el
      * predictor de landmarks al finalizar el efecto AR.
      */
     ~FaceSwapper() = default;
@@ -83,7 +87,7 @@ private:
      * @param rect_ann Caja del primer rostro en coordenadas del frame completo.
      * @param rect_bob Caja del segundo rostro en coordenadas del frame completo.
      * @return Vista del frame recortada alrededor de ambos rostros.
-     * @note Justificación: reduce el área procesada por dlib/OpenCV y baja la
+     * @note Reduce el área procesada por dlib/OpenCV y baja la
      * latencia del efecto AR en hardware limitado.
      */
     cv::Mat getMinFrame(const cv::Mat& frame, const cv::Rect& rect_ann, const cv::Rect& rect_bob);
@@ -92,7 +96,7 @@ private:
      * @brief Extrae landmarks y puntos geométricos de ambos rostros.
      * @param frame Recorte donde se encuentran los dos rostros.
      * @return No devuelve valor.
-     * @note Justificación: los landmarks permiten alinear el intercambio sin
+     * @note Los landmarks permiten alinear el intercambio sin
      * romper la coherencia espacial de la capa AR.
      */
     void getFacePoints(const cv::Mat& frame);
@@ -101,7 +105,7 @@ private:
      * @brief Calcula las transformaciones afines entre ambos rostros.
      * @param Ninguno; usa los puntos faciales almacenados.
      * @return No devuelve valor.
-     * @note Justificación: alinear geometría facial evita deformaciones bruscas
+     * @note Alinear geometría facial evita deformaciones bruscas
      * en el efecto AR.
      */
     void getTransformationMatrices();
@@ -110,7 +114,7 @@ private:
      * @brief Genera máscaras base para cada rostro.
      * @param Ninguno; usa los puntos faciales almacenados.
      * @return No devuelve valor.
-     * @note Justificación: limita el efecto AR a la región facial y evita
+     * @note Limita el efecto AR a la región facial y evita
      * contaminar el resto de la escena.
      */
     void getMasks();
@@ -119,7 +123,7 @@ private:
      * @brief Deforma las máscaras hacia la geometría destino.
      * @param Ninguno; usa las matrices afines almacenadas.
      * @return No devuelve valor.
-     * @note Justificación: conserva la forma de la cara destino para que el
+     * @note Conserva la forma de la cara destino para que el
      * overlay AR sea visualmente consistente.
      */
     void getWarppedMasks();
@@ -128,7 +132,7 @@ private:
      * @brief Combina máscaras originales y deformadas.
      * @param Ninguno; usa las máscaras internas ya calculadas.
      * @return Máscara refinada de las zonas donde se pegarán los rostros.
-     * @note Justificación: reduce bordes falsos y mejora la calidad visual del AR.
+     * @note Reduce bordes falsos y mejora la calidad visual del AR.
      */
     cv::Mat getRefinedMasks();
 
@@ -136,7 +140,7 @@ private:
      * @brief Extrae las regiones faciales desde el recorte de trabajo.
      * @param Ninguno; usa el frame y las máscaras internas.
      * @return No devuelve valor.
-     * @note Justificación: separa contenido facial de fondo para una composición limpia.
+     * @note Separa contenido facial de fondo para una composición limpia.
      */
     void extractFaces();
 
@@ -144,7 +148,7 @@ private:
      * @brief Deforma los rostros hacia sus posiciones destino.
      * @param Ninguno; usa las matrices afines y caras extraídas.
      * @return Imagen con los rostros deformados sobre fondo negro.
-     * @note Justificación: produce el contenido final que será mezclado con el frame.
+     * @note Produce el contenido final que será mezclado con el frame.
      */
     cv::Mat getWarppedFaces();
 
@@ -152,7 +156,7 @@ private:
      * @brief Corrige el color de los rostros deformados.
      * @param Ninguno; usa las regiones faciales internas.
      * @return No devuelve valor.
-     * @note Justificación: iguala iluminación para que el AR no se vea como un parche.
+     * @note Iguala iluminación para que el AR no se vea como un parche.
      */
     void colorCorrectFaces();
 
@@ -160,7 +164,7 @@ private:
      * @brief Suaviza los bordes de una máscara facial.
      * @param refined_masks Región de máscara a erosionar y difuminar.
      * @return No devuelve valor.
-     * @note Justificación: el suavizado oculta costuras y mejora la calidad del overlay.
+     * @note El suavizado oculta costuras y mejora la calidad del overlay.
      */
     void featherMask(cv::Mat& refined_masks);
 
@@ -168,7 +172,7 @@ private:
      * @brief Mezcla los rostros procesados dentro del recorte final.
      * @param Ninguno; usa el frame, rostros y máscara internos.
      * @return No devuelve valor.
-     * @note Justificación: compone la salida AR visible para la evaluación.
+     * @note Compone el overlay AR que se muestra en tiempo real.
      */
     void pasteFacesOnFrame();
 
@@ -178,7 +182,7 @@ private:
      * @param target_image Región destino que será recoloreada.
      * @param mask Máscara de píxeles válidos para la corrección.
      * @return No devuelve valor.
-     * @note Justificación: reduce diferencias de color entre cámaras/rostros y
+     * @note Reduce diferencias de color entre cámaras/rostros y
      * mejora la naturalidad del efecto AR.
      */
     void specifyHistogram(const cv::Mat& source_image, cv::Mat target_image, const cv::Mat& mask);

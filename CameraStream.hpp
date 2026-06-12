@@ -44,7 +44,7 @@ struct CameraStream {
      * @brief Deshabilita copias del estado compartido de cámara.
      * @param Ninguno.
      * @return No devuelve valor.
-     * @note Justificación: evita duplicar mutex, atomics y buffers de imagen
+     * @note Evita duplicar mutex, atomics y buffers de imagen
      * usados por los hilos de captura.
      */
     CameraStream(const CameraStream&) = delete;
@@ -53,7 +53,7 @@ struct CameraStream {
      * @brief Deshabilita asignación del estado compartido de cámara.
      * @param Ninguno.
      * @return Referencia al stream asignado, aunque esta operación está eliminada.
-     * @note Justificación: mantiene un único dueño lógico por cámara y previene
+     * @note Mantiene un único dueño lógico por cámara y previene
      * condiciones de carrera accidentales.
      */
     CameraStream& operator=(const CameraStream&) = delete;
@@ -73,7 +73,7 @@ void capture_loop(CameraStream* cam);
  * @param streamUrl URL base de la cámara.
  * @param controls Lista de pares variable/valor a configurar.
  * @return true si todos los controles se aplicaron; false en caso contrario.
- * @note Justifica el ajuste de AEC, AGC, contraste y XCLK para reducir
+ * @note El ajuste de AEC, AGC, contraste y XCLK para reducir
  * saturación, variación de exposición y jitter visual entre frames.
  */
 bool configure_esp32_cam(const std::string& streamUrl, const std::vector<std::pair<std::string, int>>& controls);

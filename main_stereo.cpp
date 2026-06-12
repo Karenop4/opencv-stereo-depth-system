@@ -117,6 +117,8 @@ static void balanceBlancosGrayWorld(const cv::Mat& src, cv::Mat& dst) {
     cv::merge(channels, dst);
 }
 
+// Bloque ajustado con asistencia de IA: CLAHE se mantiene obligatorio en la
+// vista visual, pero aislado de SGBM para no degradar el mapa de disparidad.
 /**
  * @brief Aplica CLAHE sobre luminancia sin cambiar la geometría ni los colores base.
  * @param src Imagen BGR de entrada.
@@ -515,7 +517,7 @@ int main(int argc, char** argv) {
         cv::Rect objetoCentral;
         double distanciaCentralRawCm = -1.0;
 
-        // La region central es la ROI principal de medicion exigida por la rubrica.
+        // La region central es la ROI principal para medir el objeto frente a las camaras.
         cv::Rect centro = roiCentralMedicion(stereoProc.imgSize);
         cv::Mat objetoCentroMask = mascaraPrimerPlanoCentral(dispF, centro, validDispMask);
         cv::Rect objetoCentroBox = cajaDesdeMascara(objetoCentroMask, 45);

@@ -6,6 +6,8 @@
 #include <chrono>
 #include <numeric>
 
+// Bloque ajustado con asistencia de IA: usa GStreamer como primera opcion de
+// captura para mantener el calibrador alineado con la aplicacion principal.
 std::string shell_quote_gst_value(const std::string& value) {
     std::string quoted = "'";
     for (char ch : value) {

@@ -5,6 +5,10 @@
 #include <exception>
 #include <iostream>
 
+// Efecto/filtro FaceSwap adaptado tomando como referencia:
+// https://github.com/MishaPrigara/FaceSwap
+// La integracion al pipeline de este proyecto se conecta con detecciones YOLO
+// y con el frame principal de la aplicacion estereo.
 FaceSwapper::FaceSwapper(const std::string& landmarks_path)
 {
     try

@@ -13,7 +13,7 @@
  * @brief Inicializa el estado compartido de una cámara.
  * @param u URL del stream MJPEG de la ESP32-CAM.
  * @return No devuelve valor.
- * @note Justificación: prepara flags atómicos y timestamp para capturar sin
+ * @note Prepara flags atómicos y timestamp para capturar sin
  * bloquear el procesamiento estéreo principal.
  */
 CameraStream::CameraStream(std::string u) : url(u), running(true), connected(false), lastFrameUs(0), fps(0.0) {}
@@ -22,12 +22,14 @@ CameraStream::CameraStream(std::string u) : url(u), running(true), connected(fal
  * @brief Solicita la detención del hilo de captura asociado.
  * @param Ninguno.
  * @return No devuelve valor.
- * @note Justificación: permite cerrar recursos de cámara al salir de la demo.
+ * @note Permite cerrar recursos de cámara al salir de la demo.
  */
 CameraStream::~CameraStream() {
     running = false;
 }
 
+// Bloque ajustado con asistencia de IA: prioriza GStreamer para bajar latencia
+// de captura y conserva FFMPEG/CAP_ANY como respaldo si el pipeline falla.
 static std::string shell_quote_gst_value(const std::string& value) {
     std::string quoted = "'";
     for (char ch : value) {
@@ -82,7 +84,7 @@ static bool open_capture(cv::VideoCapture& cap, const std::string& url) {
  * @brief Captura continuamente frames desde una ESP32-CAM.
  * @param cam Estado compartido de cámara donde se publica el último frame.
  * @return No devuelve valor.
- * @note Justificación: desacopla I/O de red del cálculo estéreo para mantener
+ * @note Desacopla I/O de red del cálculo estéreo para mantener
  * baja latencia en rectificación, WLS y medición de distancia.
  */
 void capture_loop(CameraStream* cam) {
@@ -141,7 +143,7 @@ void capture_loop(CameraStream* cam) {
  * @param host Salida con el host o IP.
  * @param port Salida con el puerto; usa 80 si no viene especificado.
  * @return true si la URL pudo parsearse.
- * @note Justificación: permite enviar comandos de exposición/ganancia al
+ * @note Permite enviar comandos de exposición/ganancia al
  * firmware sin depender de librerías HTTP externas pesadas.
  */
 static bool parse_http_url(const std::string& url, std::string& host, std::string& port) {
@@ -168,7 +170,7 @@ static bool parse_http_url(const std::string& url, std::string& host, std::strin
  * @param port Puerto HTTP de control.
  * @param path Ruta de control con variable y valor.
  * @return true si la cámara responde con código 200.
- * @note Justificación: fija parámetros ópticos antes de procesar profundidad,
+ * @note Fija parámetros ópticos antes de procesar profundidad,
  * reduciendo cambios de iluminación que degradan el mapa de disparidad.
  */
 static bool http_get_control(const std::string& host, const std::string& port, const std::string& path) {
@@ -223,7 +225,7 @@ static bool http_get_control(const std::string& host, const std::string& port, c
  * @param streamUrl URL del stream usado para deducir host de control.
  * @param controls Lista de pares variable/valor.
  * @return true si todos los comandos recibieron respuesta HTTP 200.
- * @note Justificación: estabiliza exposición, ganancia y reloj de cámara antes
+ * @note Estabiliza exposición, ganancia y reloj de cámara antes
  * de estimar profundidad, mejorando consistencia entre vistas izquierda/derecha.
  */
 bool configure_esp32_cam(const std::string& streamUrl, const std::vector<std::pair<std::string, int>>& controls) {

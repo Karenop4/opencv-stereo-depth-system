@@ -9,7 +9,7 @@
 /**
  * @brief Resultado de una detección con caja, confianza y clase.
  *
- * @note Justificación: encapsula la salida mínima del detector para ubicar
+ * @note Encapsula la salida mínima del detector para ubicar
  * rostros y evitar que el AR invada regiones usadas por profundidad.
  */
 struct Detection {

@@ -30,7 +30,7 @@ static Detection makeDetection(float x1, float y1, float x2, float y2, float con
  * @param modelPath Ruta del archivo ONNX exportado.
  * @param inputSize Resolución de entrada usada al crear el blob.
  * @return No devuelve valor.
- * @note Justificación: habilita detección facial en tiempo real para ubicar el
+ * @note Habilita detección facial en tiempo real para ubicar el
  * efecto AR sin interferir con la estimación estéreo de profundidad.
  */
 YOLODetector::YOLODetector(const std::string& modelPath, const cv::Size& inputSize)
@@ -62,7 +62,7 @@ YOLODetector::YOLODetector(const std::string& modelPath, const cv::Size& inputSi
  * @param image Frame BGR de entrada.
  * @param confThreshold Confianza mínima aceptada.
  * @return Lista de detecciones faciales aceptadas.
- * @note Justificación: entrega ROIs robustas para el efecto AR y permite
+ * @note Entrega ROIs robustas para el efecto AR y permite
  * excluir rostros de la búsqueda de objetos oscuros/profundidad.
  */
 std::vector<Detection> YOLODetector::detect(const cv::Mat& image, float confThreshold, float nmsThreshold) {

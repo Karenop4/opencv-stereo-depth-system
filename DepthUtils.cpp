@@ -43,7 +43,7 @@ cv::Rect expandirROIClamped(const cv::Rect& roi, const cv::Size& bounds, double 
  * @param permitirExpansion Habilita una expansión de búsqueda si hay muchos inválidos.
  * @param profundidad Nivel interno de recursión.
  * @return Mediana Z en milímetros o -1 si no se puede estimar.
- * @note Reduce ruido del sensor y mejora la estabilidad métrica exigida por la rúbrica.
+ * @note Reduce ruido del sensor y mejora la estabilidad de la medida de profundidad.
  */
 double medianaZValidaImpl(const cv::Mat& points3D, const cv::Rect& roi, bool permitirExpansion, int profundidad) {
     cv::Rect safe = roi & cv::Rect(0, 0, points3D.cols, points3D.rows);
@@ -326,8 +326,8 @@ double medianaZValida(const cv::Mat& points3D, const cv::Rect& roi) {
  * @brief ROI central usada para medir el objeto situado frente al sistema.
  * @param size Tamaño del frame rectificado.
  * @return Caja central proporcional al campo de visión.
- * @note La rúbrica pide enfocar la métrica en el objeto colocado en el centro,
- * por eso esta región tiene prioridad sobre detectores visuales auxiliares.
+ * @note Esta región tiene prioridad porque el sistema mide principalmente el
+ * objeto situado frente al centro óptico de las cámaras.
  */
 cv::Rect roiCentralMedicion(const cv::Size& size) {
     int w = std::max(70, size.width / 8);
