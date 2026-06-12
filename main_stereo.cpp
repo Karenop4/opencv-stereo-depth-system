@@ -34,7 +34,7 @@ int brilloTrack  = 100;  // 100 = 0 compensación
 /** @brief Ganancia de contraste en escala x10. */
 int contTrack    = 10;   // 10  = 1.0x multiplicador
 /** @brief Activa el preprocesado CLAHE antes de la disparidad. */
-int claheTrack   = 0;    // 1   = Activado
+int claheTrack   = 1;    // CLAHE visual obligatorio; no se usa para alterar SGBM
 /** @brief Activa balance de blancos por software para compensar tinte verde. */
 int wbSoftTrack  = 1;    // 1   = Activado
 /** @brief Área mínima de objeto expresada en centenas de píxeles. */
@@ -115,6 +115,32 @@ static void balanceBlancosGrayWorld(const cv::Mat& src, cv::Mat& dst) {
         channels[i].convertTo(channels[i], -1, gain, 0.0);
     }
     cv::merge(channels, dst);
+}
+
+/**
+ * @brief Aplica CLAHE sobre luminancia sin cambiar la geometría ni los colores base.
+ * @param src Imagen BGR de entrada.
+ * @param dst Imagen BGR con contraste local mejorado.
+ * @return No devuelve valor.
+ * @note Se usa para visualización y registro. La disparidad se calcula sobre
+ * una rama estable para evitar que el realce local cree falsas correspondencias.
+ */
+static void aplicarClaheVisual(const cv::Mat& src, cv::Mat& dst) {
+    if (src.empty() || src.channels() != 3) {
+        src.copyTo(dst);
+        return;
+    }
+
+    cv::Mat lab;
+    cv::cvtColor(src, lab, cv::COLOR_BGR2Lab);
+    std::vector<cv::Mat> canales;
+    cv::split(lab, canales);
+
+    auto clahe = cv::createCLAHE(1.2, cv::Size(16, 16));
+    clahe->apply(canales[0], canales[0]);
+
+    cv::merge(canales, lab);
+    cv::cvtColor(lab, dst, cv::COLOR_Lab2BGR);
 }
 
 /**
@@ -296,7 +322,7 @@ int main(int argc, char** argv) {
 
     cv::createTrackbar("Brillo",        "Ajustes Luz",       &brilloTrack,  200, nullptr);
     cv::createTrackbar("Contraste x10", "Ajustes Luz",       &contTrack,     30, nullptr);
-    cv::createTrackbar("CLAHE",         "Ajustes Luz",       &claheTrack,     1, nullptr);
+    cv::createTrackbar("CLAHE visual",  "Ajustes Luz",       &claheTrack,     1, nullptr);
     cv::createTrackbar("WB software",   "Ajustes Luz",       &wbSoftTrack,    1, nullptr);
     cv::createTrackbar("Area min x100", "Ajustes Vision",     &minAreaTrack, 150, nullptr);
     cv::createTrackbar("Block Size",     "Ajustes Vision",     &blockSz,       15, nullptr);
@@ -306,7 +332,8 @@ int main(int argc, char** argv) {
     cv::createTrackbar("Modo cerca",     "Ajustes Vision",     &modoCercaTrack, 1, nullptr);
 
     std::cout << "\n[CONTROLES]:" << std::endl;
-    std::cout << "  Brillo/Contraste/CLAHE -> ajuste de luz" << std::endl;
+    std::cout << "  Brillo/Contraste -> ajuste de luz para profundidad" << std::endl;
+    std::cout << "  CLAHE visual     -> siempre activo en la vista, aislado de la disparidad" << std::endl;
     std::cout << "  Area min x100 -> tamaño minimo de objeto" << std::endl;
     std::cout << "  Num Disp      -> automatico 64 / 128 / 192" << std::endl;
     std::cout << "  Dist max cm   -> umbral de objeto cercano" << std::endl;
@@ -381,7 +408,10 @@ int main(int argc, char** argv) {
 
         cv::Mat rectL, rectR;
         stereoProc.rectifyImages(frameLeft, frameRight, rectL, rectR);
-        cv::Mat vistaL = frameLeft.clone();
+        claheTrack = 1;
+        cv::Mat vistaL;
+        aplicarClaheVisual(frameLeft, vistaL);
+        cv::Mat analisisL = frameLeft;
         cv::Mat procL = rectL.clone();
         cv::Mat procR = rectR.clone();
 
@@ -402,7 +432,7 @@ int main(int argc, char** argv) {
         
         cv::Mat dispFilt, dispF;
         // SGBM + WLS producen disparidad filtrada en float, lista para visualizacion y reproyeccion 3D.
-        stereoProc.computeDisparity(procL, procR, claheTrack, dispFilt, dispF);
+        stereoProc.computeDisparity(procL, procR, 0, dispFilt, dispF);
         if (!dispF.empty()) {
             // Suavizado temporal: amortigua jitter sin recalcular nada sobre frames antiguos.
             if (dispTemporalF.empty() || dispTemporalF.size() != dispF.size()) {
@@ -423,11 +453,11 @@ int main(int argc, char** argv) {
         ++loop_idx;
         // YOLO no se ejecuta en todos los frames para no matar el rendimiento.
         if (arYoloTrack == 1 && (loop_idx % 6 == 1 || cachedFaces.empty())) {
-            cachedFaces = prepararRostrosParaAR(faceDetector.detect(vistaL, 0.35f), vistaL.size());
+            cachedFaces = prepararRostrosParaAR(faceDetector.detect(analisisL, 0.35f), analisisL.size());
         }
         if (arYoloTrack == 0) cachedFaces.clear();
         std::vector<Detection> faces = cachedFaces;
-        cv::Rect objetoVisual = detectarObjetoOscuroRectangular(vistaL, areaMin, faces);
+        cv::Rect objetoVisual = detectarObjetoOscuroRectangular(analisisL, areaMin, faces);
 
         // Primero se forma una mascara de disparidades "basicamente validas".
         cv::Mat validDispMask = (dispF > 2.0f) & (dispF < 200.0f);

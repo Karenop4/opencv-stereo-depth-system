@@ -28,8 +28,44 @@ CameraStream::~CameraStream() {
     running = false;
 }
 
+static std::string shell_quote_gst_value(const std::string& value) {
+    std::string quoted = "'";
+    for (char ch : value) {
+        if (ch == '\'') {
+            quoted += "\\'";
+        } else {
+            quoted += ch;
+        }
+    }
+    quoted += "'";
+    return quoted;
+}
+
+static std::string build_gstreamer_pipeline(const std::string& url) {
+    if (url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0) {
+        return "souphttpsrc location=" + shell_quote_gst_value(url) +
+               " is-live=true do-timestamp=true timeout=3 ! "
+               "multipartdemux ! jpegdec ! videoconvert ! "
+               "appsink drop=true max-buffers=1 sync=false";
+    }
+
+    if (url.rfind("/dev/video", 0) == 0) {
+        return "v4l2src device=" + shell_quote_gst_value(url) +
+               " ! videoconvert ! appsink drop=true max-buffers=1 sync=false";
+    }
+
+    return {};
+}
+
 static bool open_capture(cv::VideoCapture& cap, const std::string& url) {
-    // Intentamos primero con FFMPEG y timeouts para que una camara caída no bloquee indefinidamente.
+    const std::string gstPipeline = build_gstreamer_pipeline(url);
+    if (!gstPipeline.empty() && cap.open(gstPipeline, cv::CAP_GSTREAMER)) {
+        std::cout << "[CAM] Backend GStreamer activo." << std::endl;
+        return true;
+    }
+    cap.release();
+
+    // Respaldo: FFMPEG con timeouts para que una camara caida no bloquee indefinidamente.
     const std::vector<int> params = {
         cv::CAP_PROP_OPEN_TIMEOUT_MSEC, 3000,
         cv::CAP_PROP_READ_TIMEOUT_MSEC, 3000

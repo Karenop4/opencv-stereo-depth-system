@@ -6,6 +6,48 @@
 #include <chrono>
 #include <numeric>
 
+std::string shell_quote_gst_value(const std::string& value) {
+    std::string quoted = "'";
+    for (char ch : value) {
+        if (ch == '\'') {
+            quoted += "\\'";
+        } else {
+            quoted += ch;
+        }
+    }
+    quoted += "'";
+    return quoted;
+}
+
+std::string build_gstreamer_pipeline(const std::string& url) {
+    if (url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0) {
+        return "souphttpsrc location=" + shell_quote_gst_value(url) +
+               " is-live=true do-timestamp=true timeout=3 ! "
+               "multipartdemux ! jpegdec ! videoconvert ! "
+               "appsink drop=true max-buffers=1 sync=false";
+    }
+
+    if (url.rfind("/dev/video", 0) == 0) {
+        return "v4l2src device=" + shell_quote_gst_value(url) +
+               " ! videoconvert ! appsink drop=true max-buffers=1 sync=false";
+    }
+
+    return {};
+}
+
+bool open_capture(cv::VideoCapture& cap, const std::string& url) {
+    const std::string gstPipeline = build_gstreamer_pipeline(url);
+    if (!gstPipeline.empty() && cap.open(gstPipeline, cv::CAP_GSTREAMER)) {
+        std::cout << "[CAM] Backend GStreamer activo." << std::endl;
+        return true;
+    }
+    cap.release();
+
+    if (cap.open(url, cv::CAP_FFMPEG)) return true;
+    cap.release();
+    return cap.open(url, cv::CAP_ANY);
+}
+
 // ─────────────────────────────────────────────
 //  Estructura de stream por cámara
 // ─────────────────────────────────────────────
@@ -26,7 +68,7 @@ struct CameraStream {
 void capture_loop(CameraStream* cam) {
     while (cam->running) {
         cv::VideoCapture cap;
-        cap.open(cam->url, cv::CAP_FFMPEG);
+        open_capture(cap, cam->url);
         if (!cap.isOpened()) {
             cam->connected = false;
             std::this_thread::sleep_for(std::chrono::seconds(2));
